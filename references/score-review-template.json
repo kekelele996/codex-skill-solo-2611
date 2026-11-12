@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "policy": "strict-full-score-v1",
+  "candidateScore": 5,
+  "checklist": {
+    "allExplicitRequirementsVerified": false,
+    "edgeCasesVerified": false,
+    "endToEndRunsVerified": false,
+    "crossLayerReadbackVerified": false,
+    "regressionVerified": false,
+    "noKnownGaps": false,
+    "deliveryEvidenceComplete": false
+  },
+  "explicitRequirements": [],
+  "edgeCases": [],
+  "runtimeEvidence": [],
+  "knownGaps": [],
+  "maxScoreJustification": "",
+  "reviewedBy": "",
+  "reviewedAt": ""
+}

@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "difficulty": "困难",
+  "signals": {
+    "multiModule": {
+      "passed": true,
+      "modules": [
+        "真实存在的模块或数据边界A",
+        "真实存在的模块或数据边界B",
+        "真实存在的模块或数据边界C"
+      ],
+      "crossModuleInvariant": "写清跨模块必须同时守住的数据不变量，至少20字",
+      "evidence": "回指真实源码、数据模型、接口或任务状态，至少20字"
+    },
+    "designTradeoff": {
+      "passed": true,
+      "conflict": "写清两条互相牵制的业务约束，至少20字",
+      "decision": "写清事实来源、事务边界、版本策略、补偿或回滚取舍，至少20字",
+      "whyNotRoutine": "说明为什么不是普通字段校验或多一步流程，至少20字",
+      "evidence": "回指真实源码或需求证据，至少20字"
+    },
+    "complexConcern": {
+      "passed": false,
+      "kinds": [
+        "idempotency"
+      ],
+      "technicalRisk": "写清具体技术风险，至少20字",
+      "observableFailure": "写清实现错误时用户或系统会看到什么，至少20字",
+      "evidence": "回指真实源码或需求证据，至少20字"
+    }
+  },
+  "platformSignals": {
+    "multiModule": {
+      "answer": "回答这个任务如何跨越多个已有模块或数据所有权，至少20字",
+      "promptQuote": "必须逐字引用题面原句，至少12字",
+      "ifViolated": "缺了它会出现什么可见错误，至少12字"
+    },
+    "designTradeoff": {
+      "answer": "回答必须做什么设计取舍，至少20字",
+      "promptQuote": "必须逐字引用题面原句，至少12字",
+      "ifViolated": "缺了它会出现什么可见错误，至少12字"
+    },
+    "complexConcern": {
+      "answer": "回答并发、幂等、恢复、迁移、容量或对账中的技术难点，至少20字",
+      "promptQuote": "必须逐字引用题面原句，至少12字",
+      "ifViolated": "缺了它会出现什么可见错误，至少12字"
+    }
+  },
+  "crossObjectInvariant": {
+    "objects": [
+      "题面里真实出现的业务对象A",
+      "题面里真实出现的业务对象B"
+    ],
+    "invariant": "两个对象之间必须守住什么，至少20字",
+    "divergenceFailure": "两者不一致时会出现什么可见后果，至少12字"
+  },
+  "projectEvidence": {
+    "files": [
+      "src/真实文件A.ts",
+      "src/真实文件B.ts"
+    ],
+    "existingFlow": "说明现有项目里真实存在的调用链或数据流，至少20字",
+    "whyNotRoutine": "说明本题为什么不是换字段、补筛选或多加一个页面，至少20字"
+  },
+  "substantiveComplexity": {
+    "kinds": [
+      "idempotency"
+    ],
+    "promptQuote": "必须逐字引用题面中体现实质复杂度的原句，至少12字",
+    "whyHard": "说明为什么这句需求需要设计、恢复或深水调试，至少20字",
+    "visibleFailure": "实现错误时会出现什么可见后果，至少12字"
+  },
+  "mediumShapeDefense": "题面命中“在既有模块补一层”的常见中等形态时必填，写清为什么不是只加一层，至少20字",
+  "hellSignal": {
+    "passed": false,
+    "kinds": [
+      "architecture-level"
+    ],
+    "reason": "只有地狱题填写，至少20字",
+    "evidence": "只有地狱题填写，至少20字"
+  },
+  "routineOnly": false,
+  "verdict": "困难",
+  "reviewedBy": "Codex"
+}

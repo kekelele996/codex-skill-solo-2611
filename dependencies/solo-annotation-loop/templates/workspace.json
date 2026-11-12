@@ -1,0 +1,22 @@
+{
+  "projectId": "",
+  "taskType": "",
+  "taskTypeSlug": "",
+  "sequence": 1,
+  "projectDir": "",
+  "sourcePath": "",
+  "state": "prepared",
+  "currentRound": 1,
+  "promptPath": "",
+  "projectProfile": "",
+  "statePath": "",
+  "tracePath": "",
+  "deliveryFile": "",
+  "roundDirectory": "",
+  "createdAt": "",
+  "updatedAt": "",
+  "historyPromptPath": "",
+  "platformTaskId": "",
+  "platformRoundId": "",
+  "platformBaseUrl": ""
+}

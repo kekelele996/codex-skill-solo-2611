@@ -1,0 +1,62 @@
+# codex-skill-solo-2611
+
+`solo-2611` v0.4.3：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
+
+支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session、一轮有效交互，完成题面门禁、快照、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
+
+## 安装
+
+```bash
+git clone https://github.com/kekelele996/codex-skill-solo-2611.git
+cd codex-skill-solo-2611
+
+mkdir -p "$HOME/.codex/skills/solo-2611" "$HOME/.codex/skills/solo-annotation-loop"
+rsync -a ./ "$HOME/.codex/skills/solo-2611/"
+rsync -a ./dependencies/solo-annotation-loop/ "$HOME/.codex/skills/solo-annotation-loop/"
+```
+
+Python 运行时需要：
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 "$HOME/.codex/skills/solo-2611/scripts/solo2611.py" version
+```
+
+## 配置
+
+```bash
+S="$HOME/.codex/skills/solo-2611/scripts/solo2611.py"
+python3 "$S" config init
+python3 "$S" config set claude.baseUrl="<网关地址>"
+python3 "$S" config set claude.apiKey="<本期团队Key>"
+python3 "$S" config set submission.lockedDomain="<账号唯一所属领域>"
+python3 "$S" config set submission.autoSubmit=false
+python3 "$S" config test
+```
+
+推荐通过 `SOLO2611_API_KEY`、`SOLO2611_BASE_URL` 和 `GITHUB_TOKEN` 提供秘密。不要提交 `~/.codex/solo-2611/config.json`、`.env`、Cookie 或 Keychain 内容。
+
+## 最新分类
+
+| 所属领域 | 子方向 |
+|---|---|
+| 安全 | 漏洞检测与攻防、身份认证、网络与通信安全、系统安全、其他 |
+| 游戏、图形与多媒体 | 音视频处理、图形渲染、游戏开发、图像处理 |
+| 数据工程 | 数据采集、爬虫与 RPA；数仓与数据湖；数据分析与数据应用 |
+
+`submission.lockedDomain` 是 Solo2 账号级只读大类。先读真实工程，再从该大类的合法子方向中选择实际匹配项；如果工程无法匹配该大类，应换题，不能跨域提交。
+
+## 核心要求
+
+- 备注列始终为空，SOLO2 payload 不携带 `other_issues`。
+- Feedback 必须基于真实轨迹、产物快照和 `verify` 运行记录；机器会做事实回查。
+- 默认交付完整性上限为 4；打 5 必须通过严格满分审计。
+- 页面可达的页面题必须录真实页面操作；真实启动失败且页面不可达时，录制完整失败过程。
+
+## 配套项目
+
+- 工作台：<https://github.com/kekelele996/solo-2611>
+- 工程台：<https://github.com/kekelele996/project-hub>
+- 上级 GSB 参考：<https://github.com/kekelele996/codex-skill-sologsb-0917>
+
+官方规范和上级参考资料已包含在 `official-specs/`、`upstream/` 与 `dependencies/`。

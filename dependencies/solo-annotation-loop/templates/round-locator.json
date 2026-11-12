@@ -1,0 +1,16 @@
+{
+  "projectId": "",
+  "round": 1,
+  "sessionId": "",
+  "promptId": "",
+  "commitUrl": "",
+  "promptPath": "",
+  "tracePath": "",
+  "harness": "Claude Code",
+  "harnessVersion": "",
+  "startTime": "",
+  "endTime": "",
+  "stopReason": "",
+  "promptMatches": false,
+  "status": "unverified"
+}

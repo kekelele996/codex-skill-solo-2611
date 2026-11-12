@@ -1,0 +1,132 @@
+{
+  "verdict": "A 更好",
+  "reason": "A 侧方案在联调阶段读取database/init.sql时检查了迁移脚本，但数据库配置仍然保留旧约束。升级后索引列表没有用上新的版本字段，接口返回里还是缺少版本信息。B 侧方案在新增指标时同步了口径说明和默认单位，新增、编辑和重命名流程却没有接入，提交后对应配置没有写入。这个任务最重要的是升级后数据能不能对上，A 侧方案只差版本字段，B 侧方案连配置都没有写入，因此选择 A 侧方案。",
+  "languages": "Go, Gin, PostgreSQL",
+  "repro_level": "已容器化，可一键起环境",
+  "delivery": {
+    "A": {
+      "score": 3,
+      "description": "迁移脚本database/init.sql里的旧约束没有移除，升级后接口返回缺少版本信息。版本相关需求没有做完，指标读写本身可以正常运行。",
+      "evidenceIds": [
+        "A-artifact-check-01"
+      ],
+      "quality": {
+        "code": {
+          "score": 3,
+          "note": "database/init.sql保留了旧约束，迁移与接口层的版本字段各自硬编码，没有统一来源。"
+        }
+      }
+    },
+    "B": {
+      "score": 2,
+      "description": "新增、编辑和重命名三处入口都没有接入指标配置，保存后页面读回的仍是旧值，题目要求的主要功能没有达成。",
+      "evidenceIds": [
+        "B-artifact-check-01"
+      ],
+      "quality": {
+        "code": {
+          "score": 2,
+          "note": "指标配置的保存接口直接返回写死的成功结果，没有写入存储，metrics.service.ts里只有桩实现。"
+        }
+      }
+    }
+  },
+  "claims": [
+    {
+      "side": "A",
+      "type": "process",
+      "polarity": "positive",
+      "text": "A 侧方案在联调阶段读取database/init.sql时检查了迁移脚本",
+      "evidenceIds": [
+        "A-process-0001"
+      ]
+    },
+    {
+      "side": "A",
+      "type": "artifact",
+      "polarity": "negative",
+      "triggerKind": "file",
+      "trigger": "读取database/init.sql时",
+      "text": "数据库配置仍然保留旧约束",
+      "evidenceIds": [
+        "A-artifact-check-01"
+      ],
+      "objectiveConsequence": "接口返回里还是缺少版本信息"
+    },
+    {
+      "side": "B",
+      "type": "process",
+      "polarity": "positive",
+      "text": "B 侧方案在新增指标时同步了口径说明和默认单位",
+      "evidenceIds": [
+        "B-process-0001"
+      ]
+    },
+    {
+      "side": "B",
+      "type": "artifact",
+      "polarity": "negative",
+      "triggerKind": "requirement",
+      "trigger": "新增指标时",
+      "text": "提交后对应配置没有写入",
+      "evidenceIds": [
+        "B-artifact-check-01"
+      ],
+      "objectiveConsequence": "提交后对应配置没有写入"
+    }
+  ],
+  "sentenceEvidence": [
+    {
+      "sentence": "A 侧方案在联调阶段读取database/init.sql时检查了迁移脚本，但数据库配置仍然保留旧约束。",
+      "evidenceIds": [
+        "A-process-0001",
+        "A-artifact-check-01"
+      ]
+    },
+    {
+      "sentence": "升级后索引列表没有用上新的版本字段，接口返回里还是缺少版本信息。",
+      "evidenceIds": [
+        "A-artifact-check-01"
+      ]
+    },
+    {
+      "sentence": "B 侧方案在新增指标时同步了口径说明和默认单位，新增、编辑和重命名流程却没有接入，提交后对应配置没有写入。",
+      "evidenceIds": [
+        "B-process-0001",
+        "B-artifact-check-01"
+      ]
+    },
+    {
+      "sentence": "这个任务最重要的是升级后数据能不能对上，A 侧方案只差版本字段，B 侧方案连配置都没有写入，因此选择 A 侧方案。",
+      "evidenceIds": [
+        "A-artifact-check-01",
+        "B-artifact-check-01"
+      ]
+    }
+  ],
+  "stylePolicy": {
+    "plainTextOnly": true,
+    "markdownAllowed": false,
+    "bannedWords": [
+      "闭环",
+      "根因",
+      "落库",
+      "端掉",
+      "拉起",
+      "干掉"
+    ],
+    "writeOperationLabel": "入库",
+    "externalFactorReferencesAllowed": false,
+    "evaluationExcludedEvidenceAllowed": false,
+    "maxSentenceNonWhitespaceChars": 56,
+    "vagueExpressionWarnings": [
+      "真实",
+      "真正",
+      "其实",
+      "本质上",
+      "实际上"
+    ],
+    "maxLabelMentionsPerSide": 3,
+    "minSentenceChars": 8
+  }
+}

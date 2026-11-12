@@ -1,0 +1,14 @@
+{
+  "projectId": "",
+  "repoPath": "",
+  "taskType": "Bug修复",
+  "businessDomain": "",
+  "languageFramework": [],
+  "entrypoints": [],
+  "testCommands": [],
+  "buildCommands": [],
+  "reproducibility": "",
+  "candidateAreas": [],
+  "evidence": [],
+  "status": "information_needed"
+}

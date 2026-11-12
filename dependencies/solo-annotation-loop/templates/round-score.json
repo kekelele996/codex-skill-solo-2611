@@ -1,0 +1,41 @@
+{
+  "projectId": "",
+  "round": 1,
+  "sessionId": "",
+  "promptId": "",
+  "commitUrl": "",
+  "taskType": "Bug修复",
+  "difficulty": "困难",
+  "scores": {
+    "delivery": 0,
+    "instruction": 0,
+    "planning": 0,
+    "reasoning": 0,
+    "execution": 0
+  },
+  "comments": {
+    "delivery": "",
+    "instruction": "",
+    "planning": "",
+    "reasoning": "",
+    "execution": "",
+    "other": "无"
+  },
+  "evidence": [],
+  "status": "draft",
+  "gate": {
+    "counterexamplesReviewed": false,
+    "criticalPathsChecked": false,
+    "adversarialChecksPassed": false,
+    "highScoreJustification": "",
+    "authBoundaryChecked": false,
+    "stateTransitionChecked": false,
+    "concurrencyChecked": false,
+    "rollbackChecked": false,
+    "supportingEvidence": [],
+    "authBoundaryNotApplicableReason": "",
+    "stateTransitionNotApplicableReason": "",
+    "concurrencyNotApplicableReason": "",
+    "rollbackNotApplicableReason": ""
+  }
+}
