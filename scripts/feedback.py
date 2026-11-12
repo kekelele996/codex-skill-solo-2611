@@ -14,7 +14,7 @@ SOFT_MAX_FEEDBACK_CHARS = 280
 HARD_MAX_FEEDBACK_CHARS = 360
 MAX_RECOMMENDED_ANCHORS = 3
 MAX_ANCHORS = 6
-# 代码信息和数值必要时可以写，一两处不提醒，超过才提示改成业务说法。
+# 代码信息和数值必要时可以写；重要问题通常保留一两处，超过才提示改成业务说法。
 MAX_QUIET_CODE_TOKENS = 2
 MAX_QUIET_NUMBERS = 2
 FULL_RUN_ID = re.compile(
@@ -45,6 +45,10 @@ CERTAIN_COMPLETION = re.compile(
 BUSINESS_EVIDENCE = re.compile(
     r"(重跑|重算|重新运行|再次运行|回读|刷新后|核对|报告里|报告中|页面上|页面里|列表里|接口返回|查询结果|"
     r"[^。；]{1,20}后[，,]?[^。；]{0,12}(?:仍|依然|保持|变成|显示|报错|失败|推进不了|没有))"
+)
+BEHAVIOR_HINT = re.compile(
+    r"(修改|改成|只改|漏改|跳过|忽略|覆盖|写入|读取|查看|调用|执行|运行|删除|移除|返回|"
+    r"处理|扫描|判定|报告完成|没有运行|未运行|没有读取|未读取|没有处理|未处理|没有实现|未实现)"
 )
 RESIDUAL_GAP = re.compile(
     r"(问题(?:是|仍|在)|仍需|尚未|没有整理|未覆盖|缺少|只(?:能|显示|处理)|"
@@ -96,7 +100,8 @@ Feedback 写成短复盘，不抄录验收报告：默认 180–280 个非空字
 动笔前先跑 `verify --label '验证了什么' -- <真实命令>`，把真实输出固定下来；没有执行记录会被阻断。
 正文里的数字、文件、反引号标识符和报错原文都会被拿去和轨迹、产物快照、运行输出逐条比对，查不到就阻断。
 差值这类由两次真实输出算出来的数字同样认可，不要为了凑原文改数字。
-代码信息和具体数值少写，能换成业务行为、前后变化和页面或接口可见结果就换；定位问题必需的可以保留一两处。
+重要问题可以保留 1–2 个最必要的代码或运行锚点：文件名、函数名、步骤、报错原文或未实现的需求点。
+固定按“触发节点 → 实际行为 → 业务后果 → 证据锚点”写清；其余代码和数值能换成业务说法就换。
 过程段写实现时的决定和验证行为，不写复核步骤；产物段写成功路径、失败路径和页面或接口本该呈现什么。
 已经由代码和运行结果确认的能力要写“能够、可以、能、完成了、已实现”等确定表达。
 测试只写与题目需求直接相关的场景和结论，不写“x/x 条测试通过”，也不拿无关的前端类型检查充数。
@@ -388,10 +393,12 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
     if score and score <= 2 and not negatives:
         errors.append(f"打了 {score} 分但文本里没有写明失败/缺失的具体表现")
 
+    process_match = re.search(r"过程问题[:：](.*?)(?:\n\s*产物问题[:：]|$)", feedback, re.S)
+    process_text = process_match.group(1) if process_match else ""
     trigger = re.search(
         r"(第\s*\d+\s*步|在[^。；]{0,40}(?:时|后)|[^。；]{2,30}(?:时|后)[，,]|执行[^。；]{0,30}|读取[^。；]{0,30}|修改[^。；]{0,30}|"
         r"调用[^。；]{0,30}|没有运行|未运行|没有读取|未读取|直接宣称|就报告完成)",
-        feedback,
+        process_text,
     )
     consequence = re.search(
         r"(导致|造成|结果|于是|因此|无法|返回|报错|缺少|未实现|没有实现|仍为空|被拒绝|服务退出|页面打不开)",
@@ -400,6 +407,8 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
     if score and score <= 4 and negatives:
         if not trigger:
             errors.append("写了负面问题，但没有交代是在哪个操作或处理环节出的问题")
+        if not BEHAVIOR_HINT.search(process_text):
+            errors.append("写了负面问题，但没有交代具体做了什么或漏做了什么（实际行为）")
         if not consequence:
             errors.append("写了负面问题，但没有交代客观结果或业务影响")
     if score >= 4 and not re.search(

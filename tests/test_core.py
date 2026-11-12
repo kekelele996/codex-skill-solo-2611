@@ -767,6 +767,8 @@ def test_feedback_check(tmp_path):
 
     necessary_code = concise.replace(
         "问题是每次增量运行", "问题是 `incremental_scan` 每次增量运行"
+    ).replace(
+        "目标表保留了较新的商品记录", "`merge_batches()` 保留了较新的商品记录"
     )
     p.write_text(necessary_code, encoding="utf-8")
     result = fb.check(p)
@@ -803,6 +805,16 @@ def test_feedback_check(tmp_path):
     p.write_text(plain_negative, encoding="utf-8")
     result = fb.check(p)
     assert result["ok"] and not result["warnings"], result
+
+    no_behavior = re.sub(
+        r"过程问题：.*?(?=\n\n产物问题：)",
+        "过程问题：第 2 步之后任务报错，随后任务无法推进。",
+        plain_negative,
+        flags=re.S,
+    )
+    p.write_text(no_behavior, encoding="utf-8")
+    result = fb.check(p)
+    assert any("实际行为" in item for item in result["errors"])
 
     p.write_text(plain_negative.replace("按创建时的特征定义", "按创建时的口径").replace("需求里的", "题面里的"), encoding="utf-8")
     result = fb.check(p)
