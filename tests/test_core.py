@@ -136,9 +136,9 @@ def test_legacy_data_other_default_migrates_to_data_lake():
     path.unlink()
 
 
-def test_submission_auto_switch_defaults_off():
+def test_submission_auto_switch_defaults_on():
     config = load_config()
-    assert config["submission"]["autoSubmit"] is False
+    assert config["submission"]["autoSubmit"] is True
     assert config["submission"]["server"] == "https://solo2.jzxhnh.com"
 
 
@@ -1143,7 +1143,7 @@ def test_end_to_end(tmp_path, capsys):
                        "initialPushed": "x", "artifactSha": state["artifact"]["sha"]}
     from common import save_state
     save_state(root, state)
-    assert _run("export", "--task-root", str(root)) == 0
+    assert _run("export", "--task-root", str(root), "--no-submit") == 0
     rows = excel.read_back(root / "delivery" / "交付表.xlsx")
     assert len(rows) == 1
     row = rows[0]

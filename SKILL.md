@@ -50,8 +50,8 @@ description: >
 - 轨迹和录屏当前在本地，Excel 填绝对路径；上传对象存储后再替换链接。
 - 「备注」列在任何情况下都保持为空。交付表固定写空值，SOLO2 新建、上传和返修 payload 都剔除
   `other_issues`，不得把环境异常、运行过程或补充说明写进备注。
-- SOLO2 自动提交默认关闭。开关关闭时只生成本地交付并允许人工核验后执行 `submit --execute`；
-  打开后 `export` 自动上传轨迹和录屏、提交并轮询质检。
+- SOLO2 自动提交默认开启，不再等待本地二次确认。`export` 完成门禁后会直接上传轨迹和录屏、
+  提交并轮询质检；需要排障时可以显式运行 `submit --dry-run`，但正常交付路径不停在本地确认。
 - `SUBMITTED` 不是完成；只有 `QC_PASSED` 才算平台通过。`PENDING_FIX` 必须返修原记录，
   `QC_REJECTED`、`QC_DISCARDED`、`QC_FAILED` 或轮询超时都必须保留证据并停止。
 - **最终产物呈现属于交付门禁**：任务完成、暂停、阻断或准备结束本轮时，最终回复必须按
@@ -126,7 +126,7 @@ python3 $S config init
 python3 $S config set claude.baseUrl=<网关地址> claude.apiKey=<本期团队Key>
 python3 $S config test
 python3 $S config show
-python3 $S config set submission.autoSubmit=false
+python3 $S config set submission.autoSubmit=true
 ```
 
 配置文件为 `~/.codex/solo-2611/config.json`（0600）。`SOLO2611_API_KEY`、`SOLO2611_BASE_URL`
@@ -327,8 +327,8 @@ python3 $S config set submission.autoSubmit=false
    也不能通过返修或另建记录绕过。
 
    ```bash
-   python3 $S submit --task-root ROOT               # 默认 dry-run；开关打开时自动执行
-   python3 $S submit --task-root ROOT --execute     # 人工确认后提交
+   python3 $S submit --task-root ROOT               # 默认直接提交并轮询
+   python3 $S submit --task-root ROOT --dry-run     # 仅在排障时预览，不提交
    python3 $S submission-status --task-root ROOT --submission-id ID
    ```
 

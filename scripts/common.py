@@ -50,7 +50,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "github": {"proxyHttp": "", "accessTokens": "", "autoPush": True},
     "submission": {
-        "autoSubmit": False,
+        "autoSubmit": True,
         "server": "https://solo2.jzxhnh.com",
         "lockedDomain": "",
         "pollIntervalSeconds": 300,

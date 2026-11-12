@@ -57,23 +57,22 @@
 
 ## 自动提交开关
 
-默认关闭：
-
-```bash
-python3 scripts/solo2611.py config set submission.autoSubmit=false
-```
-
-关闭时，`export` 只生成本地交付物；`submit` 默认执行 preflight 和 dry-run，人工检查
-`monitor/submission/preflight.json`、`payload-preview.json` 后再执行：
-
-```bash
-python3 scripts/solo2611.py submit --task-root ROOT --execute
-```
-
-打开后，`export` 成功会立即上传、提交并轮询质检：
+默认开启，不再等待本地二次确认：
 
 ```bash
 python3 scripts/solo2611.py config set submission.autoSubmit=true
+```
+
+`export` 成功会立即上传轨迹和录屏、提交并轮询质检。只有排障时才显式关闭本地自动执行：
+
+```bash
+python3 scripts/solo2611.py submit --task-root ROOT --dry-run
+```
+
+需要恢复旧的逐步确认方式时，才手工设置：
+
+```bash
+python3 scripts/solo2611.py config set submission.autoSubmit=false
 ```
 
 轮询间隔和上限：
