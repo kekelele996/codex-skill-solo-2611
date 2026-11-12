@@ -148,6 +148,111 @@ def test_submission_id_extraction():
     assert submission._extract_submission_id({"items": [{"id": 11, "status": "QC_PASSED"}]}) == 11
 
 
+def test_submission_uses_only_workbench_platform_session(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+            self.status_code = 200
+            self.text = json.dumps(payload)
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    def fake_get(url, timeout):
+        calls.append(("GET", url))
+        return FakeResponse(
+            {
+                "solo2": {
+                    "base_url": "https://solo2.example/app",
+                    "username": "lixiaoyu",
+                    "password": "<set>",
+                }
+            }
+        )
+
+    def fake_post(url, json, timeout):
+        calls.append(("POST", url, json))
+        return FakeResponse(
+            {
+                "ok": True,
+                "account": "lixiaoyu",
+                "server": "https://solo2.example",
+                "cookie": "sid=fresh",
+                "csrf": "fresh-csrf",
+            }
+        )
+
+    monkeypatch.setattr(submission.requests, "get", fake_get)
+    monkeypatch.setattr(submission.requests, "post", fake_post)
+    platform = submission._workbench_platform()
+
+    assert platform["username"] == "lixiaoyu"
+    assert platform["server"] == "https://solo2.example"
+    assert platform["cookie"] == "sid=fresh"
+    assert calls[0][1] == submission.MONITOR_CONFIG_URL
+    assert calls[1][1] == submission.MONITOR_SESSION_URL
+
+
+def test_submission_rejects_workbench_platform_identity_mismatch(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+        text = "{}"
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    monkeypatch.setattr(
+        submission.requests,
+        "get",
+        lambda url, timeout: FakeResponse(
+            {
+                "solo2": {
+                    "base_url": "https://solo2.example/app",
+                    "username": "lixiaoyu",
+                    "password": "<set>",
+                }
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        submission.requests,
+        "post",
+        lambda url, json, timeout: FakeResponse(
+            {
+                "ok": True,
+                "account": "liudong",
+                "server": "https://solo2.example",
+                "cookie": "sid=stale",
+                "csrf": "stale-csrf",
+            }
+        ),
+    )
+
+    with pytest.raises(Solo2611Error, match="身份校验失败"):
+        submission._workbench_platform()
+
+
+def test_submission_source_has_no_direct_keychain_or_cached_session_access():
+    source = Path(submission.__file__).read_text(encoding="utf-8")
+    assert "_keychain_read" not in source
+    assert "_keychain_write" not in source
+    assert "find-generic-password" not in source
+    assert "SOLO2_COOKIE" not in source
+    assert "SOLO2_CSRF" not in source
+    assert "SOLO2_PASSWORD" not in source
+
+
 def test_github_repo_slug_is_readable():
     assert gh.repo_slug("数据脱敏与 k-匿名合规工作台") == (
         "data-masking-k-anonymity-compliance-workbench"
@@ -653,7 +758,7 @@ def test_feedback_check(tmp_path):
             "产物问题：",
             "产物问题：逐项核对并运行后，门店补传批次只写入了符合最新版本的记录，"
             "其余因为早已入库或版本更旧被忽略，目标表保留了较新的商品记录，读取、写入和忽略数能够对上。"
-            "问题是每次增量运行仍从头扫描整批源数据，没有只处理补传的对象，源数据越多耗时越长。",
+                "问题是补传导入功能每次增量运行仍从头扫描整批源数据，没有只处理补传的对象，源数据越多耗时越长。",
         )
     )
     p.write_text(concise, encoding="utf-8")

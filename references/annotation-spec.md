@@ -82,6 +82,8 @@ Terminal 的实际失败过程，不启动 Chrome、不切换另一套环境补�
 ## 平台提交
 
 - 当前 SOLO2 表单按服务端动态 schema 提交；轨迹和录屏分别上传，写入 `trace_file` 和 `screencast`。
+- 提交平台地址、账号、密码存在性和认证会话只从本地工作台获取。技能禁止直接读系统 Keychain，
+  禁止读取认证环境变量或复用缓存 Cookie；每次操作先校验平台返回账号与工作台配置完全一致。
 - 自动提交开关 `submission.autoSubmit` 默认关闭。关闭时先 dry-run，人工确认后再 `submit --execute`；
   打开时 `export` 完成即提交并轮询。
 - `SUBMITTED` 只是已提交，不是通过。只有 `QC_PASSED` 是成功终态；`PENDING_FIX` 更新原记录的允许字段，

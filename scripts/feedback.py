@@ -50,6 +50,14 @@ RESIDUAL_GAP = re.compile(
     r"(问题(?:是|仍|在)|仍需|尚未|没有整理|未覆盖|缺少|只(?:能|显示|处理)|"
     r"受限于|不足|缺口|待补|需要人工|人工复跑|后续仍需)"
 )
+# 4 分的残余缺口必须落在可定位的业务页面、功能点或验证环节上。
+# 「完整流程缺少回归」这类整段式描述不算具体位置。
+RESIDUAL_LOCATION = re.compile(
+    r"(?:页面|接口|数据库|查询|保存|解析|草稿|发布|切换|回滚|血缘|影响分析|"
+    r"错误输入|失败保存|丢弃|导入|导出|迁移|重跑|恢复|报告|列表|详情|"
+    r"按钮|表单|字段|校验|回归用例|验证环节)",
+    re.IGNORECASE,
+)
 CODE_TOKEN = re.compile(
     r"(`[^`]+`|[A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|java|cs|json|html|css|vue|sql|toml|yaml|"
     r"yml|csv|tsv|parquet|ipynb|c|cc|cpp|h|hpp)(?![A-Za-z0-9_])|(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]*\(\)|"
@@ -92,6 +100,7 @@ Feedback 写成短复盘，不抄录验收报告：默认 180–280 个非空字
 过程段写实现时的决定和验证行为，不写复核步骤；产物段写成功路径、失败路径和页面或接口本该呈现什么。
 已经由代码和运行结果确认的能力要写“能够、可以、能、完成了、已实现”等确定表达。
 测试只写与题目需求直接相关的场景和结论，不写“x/x 条测试通过”，也不拿无关的前端类型检查充数。
+4 分的残余缺口必须点到具体页面、功能点或验证环节，不能只写“整体流程缺少回归”。
 常规高质量完成的最高分是 4；考虑给 5 时必须先填写并通过 monitor/score-review.json 的严格满分审计。
 读取、写入、忽略等计数要解释业务含义。完整正例见 solo-2611 技能的 references/feedback-guide.md。
 先读原始轨迹、产物 diff 和录屏；Agent 起草后由标注专家复核事实、分数和措辞。
@@ -361,6 +370,21 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
         errors.append("打了 4 分但写的是阻断性失败；4 分只能有小瑕疵，需按实际结果重评")
     if score == 4 and not RESIDUAL_GAP.search(feedback):
         errors.append("打了 4 分但没有写明少量但不能忽略的残余缺口或覆盖限制")
+    if score == 4:
+        residual_clauses = [
+            clause for clause in re.split(r"(?<=[。！？；\n])", feedback)
+            if RESIDUAL_GAP.search(clause)
+        ]
+        if not any(
+            RESIDUAL_LOCATION.search(clause)
+            or CODE_TOKEN.search(clause)
+            or ANCHOR_PATTERN.search(clause)
+            for clause in residual_clauses
+        ):
+            errors.append(
+                "4 分反馈的残余缺口没有具体位置；必须点名页面、功能点或验证环节，"
+                "不能只写“完整流程/整体流程缺少回归”"
+            )
     if score and score <= 2 and not negatives:
         errors.append(f"打了 {score} 分但文本里没有写明失败/缺失的具体表现")
 

@@ -9,9 +9,18 @@
 - 详情与轮询：`GET /api/v1/submissions/{id}`
 - 返修：`PUT /api/v1/submissions/{id}`
 
-账号和工作台配置从 `http://127.0.0.1:8099/api/system/config` 读取。配置接口只返回密码
-`<set>`/`<unset>`，实际密码从 macOS Keychain `solo-auto/solo2.password` 读取。登录成功后，
-Cookie、CSRF 和密码写入 `solo2-jzxhnh-*` Keychain，不写入任务目录、日志或回复。
+提交平台地址、账号和密码存在性只从 `http://127.0.0.1:8099/api/system/config` 读取；认证会话只从
+`POST http://127.0.0.1:8099/api/system/solo2/session` 获取。工作台是凭据的唯一所有者，并由工作台
+使用其保存的密码完成登录。
+
+严格禁令：
+
+- 技能进程禁止执行 `security`、禁止直接读取系统 Keychain，也禁止读取或复用
+  `SOLO2_COOKIE` / `SOLO2_CSRF` / `SOLO2_PASSWORD`。
+- 禁止持久化 Cookie、CSRF 或密码，禁止跨进程复用登录会话。
+- 每次提交、查询和返修都必须重新从工作台取得临时会话。
+- 会话返回的账号必须与 `solo2.username` 完全一致，平台地址必须与 `solo2.base_url` 的同源地址一致。
+  任一不一致立即停止；不能把“还能访问”当作身份正确的证据。
 
 ## 上传
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
-import os
 import re
 import subprocess
 import time
@@ -22,8 +21,7 @@ from spec import DOMAINS
 
 DEFAULT_SERVER = "https://solo2.jzxhnh.com"
 MONITOR_CONFIG_URL = "http://127.0.0.1:8099/api/system/config"
-KEYCHAIN_SERVICE = "solo2-jzxhnh"
-MONITOR_KEYCHAIN_SERVICE = "solo-auto"
+MONITOR_SESSION_URL = "http://127.0.0.1:8099/api/system/solo2/session"
 TRACE_MAX_BYTES = 27 * 1024 * 1024
 VIDEO_MAX_BYTES = 500 * 1024 * 1024
 GITHUB_COMMIT_RE = re.compile(r"^https://github\.com/[^/\s]+/[^/\s]+/commit/[0-9a-fA-F]{40}/?$")
@@ -42,74 +40,81 @@ def _origin(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
 
 
-def _keychain_read(service: str, account: str = "") -> str:
-    proc = subprocess.run(
-        ["security", "find-generic-password", "-a", account or os.environ.get("USER", ""), "-s", service, "-w"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return proc.stdout.rstrip("\n") if proc.returncode == 0 else ""
+def _workbench_platform(*, server_hint: str = "") -> dict[str, str]:
+    """Load the authoritative platform identity and one fresh session.
 
-
-def _keychain_write(service: str, value: str, account: str = "") -> None:
-    user = account or os.environ.get("USER", "")
-    subprocess.run(["security", "delete-generic-password", "-a", user, "-s", service], capture_output=True)
-    proc = subprocess.run(
-        ["security", "add-generic-password", "-a", user, "-s", service, "-U", "-w", value],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise Solo2611Error(f"写入 Keychain 失败: {service}")
+    The skill must never read the system keychain, reuse browser cookies or
+    trust a cached login. The workbench owns the configured username, platform
+    URL and password; it returns a fresh session only after the platform reports
+    the same account name.
+    """
+    try:
+        config_response = requests.get(MONITOR_CONFIG_URL, timeout=20)
+        config_response.raise_for_status()
+        monitor = config_response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise Solo2611Error(f"读取本地工作台配置失败: {exc}") from exc
+    solo2 = monitor.get("solo2") if isinstance(monitor.get("solo2"), dict) else {}
+    username = str(solo2.get("username") or "").strip()
+    if not username:
+        raise Solo2611Error("本地工作台未配置 SOLO2 账号，禁止回退到缓存会话或 Keychain")
+    if str(solo2.get("password") or "") != "<set>":
+        raise Solo2611Error("本地工作台未保存 SOLO2 密码；请在 /system 中配置后重试")
+    configured_server = _origin(str(solo2.get("base_url") or ""))
+    if server_hint and _origin(server_hint) != configured_server:
+        raise Solo2611Error(
+            f"提交地址必须来自工作台：工作台为 {configured_server}，当前调用为 {_origin(server_hint)}"
+        )
+    try:
+        session_response = requests.post(
+            MONITOR_SESSION_URL,
+            json={"expected_account": username, "expected_server": configured_server},
+            timeout=30,
+        )
+        session_response.raise_for_status()
+        session = session_response.json()
+    except (requests.RequestException, ValueError) as exc:
+        text = ""
+        if isinstance(exc, requests.HTTPError) and exc.response is not None:
+            text = exc.response.text[:600]
+        raise Solo2611Error(f"从本地工作台获取 SOLO2 会话失败: {text or exc}") from exc
+    if session.get("ok") is not True:
+        raise Solo2611Error(f"工作台拒绝建立 SOLO2 会话: {session.get('message') or '未知错误'}")
+    account = str(session.get("account") or "").strip()
+    if account != username:
+        raise Solo2611Error(f"SOLO2 身份校验失败：工作台配置 {username}，平台返回 {account or '空'}")
+    server = _origin(str(session.get("server") or ""))
+    if server != configured_server:
+        raise Solo2611Error(
+            f"SOLO2 平台地址不一致：工作台配置 {configured_server}，会话返回 {server}"
+        )
+    cookie = str(session.get("cookie") or "").strip()
+    csrf = str(session.get("csrf") or "").strip()
+    if not cookie or not csrf:
+        raise Solo2611Error("工作台返回的 SOLO2 会话缺少 Cookie 或 CSRF")
+    return {
+        "username": username,
+        "account": account,
+        "server": server,
+        "cookie": cookie,
+        "csrf": csrf,
+    }
 
 
 class ApiClient:
-    def __init__(self, server: str):
-        self.server = _origin(server)
-        self.cookie = os.environ.get("SOLO2_COOKIE", "").strip() or _keychain_read(f"{KEYCHAIN_SERVICE}-cookie")
-        self.csrf = os.environ.get("SOLO2_CSRF", "").strip() or _keychain_read(f"{KEYCHAIN_SERVICE}-csrf")
-        self.password = os.environ.get("SOLO2_PASSWORD", "").strip() or _keychain_read(f"{KEYCHAIN_SERVICE}-password")
+    def __init__(self, server: str = ""):
+        self.server = ""
+        self.cookie = ""
+        self.csrf = ""
         self.username = ""
+        self._authenticate_from_workbench(server)
 
-    def _login_from_monitor(self) -> None:
-        if not self.password:
-            self.password = _keychain_read("solo2.password", "solo-auto")
-        if not self.password:
-            raise Solo2611Error("工作台未提供 SOLO2 密码，Keychain 缺少 solo-auto/solo2.password")
-        try:
-            config = requests.get(MONITOR_CONFIG_URL, timeout=20)
-            config.raise_for_status()
-            monitor = config.json()
-        except (requests.RequestException, ValueError) as exc:
-            raise Solo2611Error(f"读取本地工作台配置失败: {exc}") from exc
-        username = str(((monitor.get("solo2") or {}).get("username")) or "").strip()
-        if not username:
-            raise Solo2611Error("本地工作台未配置 SOLO2 账号")
-        response = requests.post(
-            self.server + "/api/v1/auth/login",
-            json={"username": username, "password": self.password},
-            headers={
-                "Accept": "application/json, text/plain, */*",
-                "Origin": self.server,
-                "Referer": self.server + "/app/submit",
-                "User-Agent": "solo-2611-submit/1.0",
-            },
-            timeout=30,
-        )
-        if response.status_code >= 400:
-            raise Solo2611Error(f"SOLO2 登录失败: HTTP {response.status_code} {response.text[:300]}")
-        payload = response.json()
-        csrf = str(payload.get("csrf_token") or "").strip()
-        cookie = "; ".join(f"{item.name}={item.value}" for item in response.cookies)
-        if not csrf or not cookie:
-            raise Solo2611Error("SOLO2 登录成功但响应缺少 Cookie 或 CSRF")
-        self.username = username
-        self.cookie, self.csrf = cookie, csrf
-        _keychain_write(f"{KEYCHAIN_SERVICE}-cookie", cookie)
-        _keychain_write(f"{KEYCHAIN_SERVICE}-csrf", csrf)
-        _keychain_write(f"{KEYCHAIN_SERVICE}-password", self.password)
+    def _authenticate_from_workbench(self, server_hint: str = "") -> None:
+        platform = _workbench_platform(server_hint=server_hint)
+        self.server = platform["server"]
+        self.cookie = platform["cookie"]
+        self.csrf = platform["csrf"]
+        self.username = platform["account"]
 
     def _headers(self, *, json_body: bool = False) -> dict[str, str]:
         headers = {
@@ -151,7 +156,7 @@ class ApiClient:
             except requests.RequestException as exc:
                 raise Solo2611Error(f"{method} {url} 网络失败: {exc}") from exc
             if response.status_code == 401 and attempt == 0:
-                self._login_from_monitor()
+                self._authenticate_from_workbench(self.server)
                 continue
             if response.status_code >= 400:
                 raise Solo2611Error(f"{method} {url} 返回 HTTP {response.status_code}: {response.text[:2000]}")
@@ -451,7 +456,7 @@ def preflight(
         "schemaVersion": 1,
         "ok": True,
         "server": client.server,
-        "account": client.username or "(stored session)",
+        "account": client.username,
         "schemaFingerprint": schema.get("fingerprint"),
         "fieldCount": len(fields),
         "existingSubmission": existing,

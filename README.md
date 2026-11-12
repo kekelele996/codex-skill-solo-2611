@@ -1,6 +1,6 @@
 # codex-skill-solo-2611
 
-`solo-2611` v0.4.3：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
+`solo-2611` v0.4.6：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
 
 支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session、一轮有效交互，完成题面门禁、快照、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
 
@@ -30,11 +30,13 @@ python3 "$S" config init
 python3 "$S" config set claude.baseUrl="<网关地址>"
 python3 "$S" config set claude.apiKey="<本期团队Key>"
 python3 "$S" config set submission.lockedDomain="<账号唯一所属领域>"
-python3 "$S" config set submission.autoSubmit=false
+python3 "$S" config set submission.autoSubmit=true
 python3 "$S" config test
 ```
 
-推荐通过 `SOLO2611_API_KEY`、`SOLO2611_BASE_URL` 和 `GITHUB_TOKEN` 提供秘密。不要提交 `~/.codex/solo-2611/config.json`、`.env`、Cookie 或 Keychain 内容。
+推荐通过 `SOLO2611_API_KEY`、`SOLO2611_BASE_URL` 和 `GITHUB_TOKEN` 提供模型与快照仓库秘密。SOLO2 的提交地址、账号和认证会话只能从本地工作台获取；技能不直接读取系统 Keychain、认证环境变量或缓存 Cookie。
+
+自动提交已按要求开启：`export` 通过后直接上传、新建提交并轮询质检，不再做本地二次确认。只有 `QC_PASSED` 才算通过。
 
 ## 最新分类
 
@@ -51,7 +53,9 @@ python3 "$S" config test
 - 备注列始终为空，SOLO2 payload 不携带 `other_issues`。
 - Feedback 必须基于真实轨迹、产物快照和 `verify` 运行记录；机器会做事实回查。
 - 默认交付完整性上限为 4；打 5 必须通过严格满分审计。
+- 4 分必须清楚写出残余缺口，并对已经确认完成的能力与扣分点分别说明。
 - 页面可达的页面题必须录真实页面操作；真实启动失败且页面不可达时，录制完整失败过程。
+- 完成、暂停、阻断或结束本轮时，最终回复必须完整保留固定六段交付格式。
 
 ## 配套项目
 

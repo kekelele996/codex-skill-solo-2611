@@ -26,6 +26,10 @@ description: >
 - SOLO2 账号只允许一个所属领域，子方向不锁。新建任务、写提示词和提交前都必须读取配置中的
   `submission.lockedDomain` 作为唯一账号大类；该值一经设置即只读，不能为了适配单题用
   `config set`、直接修改任务状态或更换交付表标签。
+- SOLO2 的提交平台地址、账号和登录会话只能来自本地工作台。技能进程禁止直接读取系统 Keychain、
+  禁止读取或复用 `SOLO2_COOKIE` / `SOLO2_CSRF` / `SOLO2_PASSWORD`、禁止沿用旧浏览器会话。
+  每次提交、查询和返修都必须先从工作台获取新会话，并校验平台返回账号与工作台配置账号完全一致；
+  不一致或工作台不可用时立即停止，不能猜测、切换账号或继续提交。
 - 账号大类决定可选子方向集合。必须先读真实工程，再从该大类的合法子方向中选择最匹配的一项；
   如果工程无法真实归入任一同大类子方向，直接拒绝提交。可以匹配时，只把大类保持为配置值，
   子方向填写实际匹配项。平台历史中的首条提交领域只用于交叉核验，不能反向授权跨域提交。
@@ -50,6 +54,9 @@ description: >
   打开后 `export` 自动上传轨迹和录屏、提交并轮询质检。
 - `SUBMITTED` 不是完成；只有 `QC_PASSED` 才算平台通过。`PENDING_FIX` 必须返修原记录，
   `QC_REJECTED`、`QC_DISCARDED`、`QC_FAILED` 或轮询超时都必须保留证据并停止。
+- **最终产物呈现属于交付门禁**：任务完成、暂停、阻断或准备结束本轮时，最终回复必须按
+  `references/final-delivery-format.md` 的固定六段呈现。不得只返回状态行、任务目录、文件清单或摘要；
+  即使外部流程要求输出额外结束标记，也必须先完整呈现固定六段，再把结束标记单独放在最后一行。
 
 ## 证据与文案边界
 
@@ -78,6 +85,8 @@ description: >
 - 交付完整性默认高质量上限为 `4`。`5` 不是“没触发错误”的奖励，必须满足
   `references/score-calibration.md` 的严格条件，并填写 `monitor/score-review.json`；
   存在未固化的回归、未覆盖边界、分页/规模限制或任何已知缺口时评 `4`。
+- `4` 分必须把残余缺口落到具体页面、功能点或验证环节。只写“完整流程缺少自动化回归”
+  或“整体仍需人工复验”不够，`feedback --check` 会阻断，避免复核人无法判断后续要补哪条路径。
 - 测试证据必须对准题目的业务目标。过程段写与需求直接相关的测试场景和它覆盖的业务不变量，一般不写测试文件名；
   不把“x/x 条测试通过”或无关的前端类型检查当成泛化证据，完整套件结果留在轨迹与复核材料。
 - Feedback 出现读取、写入、忽略、拒绝等计数时，要说明每部分对应的业务含义，让没读代码的人能看懂
@@ -307,8 +316,10 @@ python3 $S config set submission.autoSubmit=false
 
 10. **submit / repair**：
 
-   从本地工作台获取 Solo2 账号，实际密码从 Keychain `solo-auto/solo2.password` 读取；
-   登录后 Cookie 和 CSRF 只放 Keychain。提交上传当前主会话 JSONL 和正式录屏两个文件，
+   提交平台地址、账号和认证会话只从本地工作台获取。工作台负责使用其保存的平台凭据建立新会话；
+   技能不得直接读取系统 Keychain、读取认证环境变量或复用缓存 Cookie。每次提交、查询和返修都先校验
+   工作台配置账号、平台返回账号和会话平台地址三者一致，任一不一致立即停止。
+   提交上传当前主会话 JSONL 和正式录屏两个文件，
    其余字段按服务端动态 schema 从交付表映射。完整协议见
    [references/platform-submission.md](references/platform-submission.md)。
    预检以配置中的账号大类为准，再用账号历史的首条提交领域交叉核验。大类不一致、配置缺失，
@@ -335,8 +346,10 @@ python3 $S config set submission.autoSubmit=false
 11. **status / cleanup**：
 
     `status` 检查十一项交付；`cleanup` 只删除本题容器，交互容器未 collect 时拒绝。
+    无论最终是全部通过、真实阻断还是按要求停在导出前，结束本轮前都必须按
+    `references/final-delivery-format.md` 呈现已有产物、录屏、Feedback 正文和未解决问题。
 
-单题完成后按 `references/final-delivery-format.md` 汇报。
+单题完成后不得省略 `references/final-delivery-format.md` 规定的任何交付段落。
 
 ## 目录
 
