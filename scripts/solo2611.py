@@ -567,6 +567,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if mode not in {"supervised", "print"}:
         raise Solo2611Error("--mode 只能是 supervised 或 print")
     if mode == "supervised":
+        managed.assert_interactive_prereqs()
         ws = ws_of(state)
         os.chmod(ws, 0o777)
         attempt = managed.prepare_attempt(task_root, state, image)

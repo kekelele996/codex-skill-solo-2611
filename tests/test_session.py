@@ -224,6 +224,10 @@ def test_managed_names_are_docker_and_tmux_safe() -> None:
     assert re.fullmatch(r"[a-z0-9][a-z0-9_-]*", tmux_name)
 
 
+def test_interactive_prerequisites_accept_current_tmux() -> None:
+    session.assert_interactive_prereqs()
+
+
 def test_abort_is_terminal_and_writes_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     root = _task_root(tmp_path)
     monkeypatch.setattr(session, "container_exists", lambda _: False)

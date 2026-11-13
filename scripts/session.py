@@ -14,6 +14,7 @@ import os
 import re
 import shlex
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -48,6 +49,19 @@ REPL_READY = re.compile(r"(?m)(?:^|\n)\s*(?:>|❯|›)\s*$")
 SCREEN_BUSY = re.compile(r"(?i)esc\s+to\s+interrupt|ctrl\+c\s+to\s+interrupt|thinking|working")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
+
+
+def assert_interactive_prereqs() -> None:
+    if os.name == "nt":
+        raise Solo2611Error("受管交互模式暂不支持 Windows；可切回 claude.runMode=print")
+    binary = shutil.which("tmux")
+    if not binary:
+        raise Solo2611Error("受管交互模式需要 tmux >= 3.0；安装 tmux 或切回 claude.runMode=print")
+    result = run(["tmux", "-V"], check=False, timeout=10)
+    text = out(result)
+    match = re.search(r"tmux\s+(\d+)\.(\d+)", text)
+    if result.returncode != 0 or not match or (int(match.group(1)), int(match.group(2))) < (3, 0):
+        raise Solo2611Error(f"受管交互模式需要 tmux >= 3.0，当前为 {text or '未知'}")
 
 
 def _parse_time(value: Any) -> datetime | None:
