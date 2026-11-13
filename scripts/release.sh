@@ -29,18 +29,24 @@ version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encodi
 source_hash="$(scripts_hash "${SOURCE}")"
 
 for target in "${TARGETS[@]}"; do
-  mkdir -p "$(dirname "${target}")"
+  physical="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' "${target}")"
+  if [[ " ${seen_targets[*]:-} " == *" ${physical} "* ]]; then
+    printf '已跳过同一物理目录：%s -> %s\n' "${target}" "${physical}"
+    continue
+  fi
+  seen_targets+=("${physical}")
+  mkdir -p "$(dirname "${physical}")"
   rsync -a --delete \
     --exclude '.git/' \
     --exclude '.pytest_cache/' \
     --exclude '__pycache__/' \
     --exclude '.DS_Store' \
-    "${SOURCE}/" "${target}/"
-  target_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "${target}/VERSION.json")"
-  target_hash="$(scripts_hash "${target}")"
+    "${SOURCE}/" "${physical}/"
+  target_version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "${physical}/VERSION.json")"
+  target_hash="$(scripts_hash "${physical}")"
   if [[ "${target_version}" != "${version}" || "${target_hash}" != "${source_hash}" ]]; then
-    echo "发布校验失败：${target} version=${target_version} hash=${target_hash}" >&2
+    echo "发布校验失败：${physical} version=${target_version} hash=${target_hash}" >&2
     exit 2
   fi
-  printf '已发布 %s version=%s scripts=%s\n' "${target}" "${target_version}" "${target_hash}"
+  printf '已发布 %s -> %s version=%s scripts=%s\n' "${target}" "${physical}" "${target_version}" "${target_hash}"
 done
