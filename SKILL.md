@@ -20,7 +20,10 @@ description: >
 
 ## 固定口径
 
-- 一题 = 一个新容器 = 一个 session = 一轮有效交互 = 一条数据。提示词只发一次，不追问、不纠错、不发“继续”。
+- 一题 = 一个新容器 = 一个 session = 一条数据。提示词只发一次；不追问、不纠错。模型结构中断时，
+  只能在同一会话里发送字面 `继续`，最多 2 次；不恢复快照、不换容器、不整题重跑。
+- 收到任务级“继续”时，先运行 `run-status --json` 和 `resume`，从状态文件与事件日志接回现有会话。
+  不重新 `init`、不重新发送题面、不执行 `reset`，也不把任务级继续计入模型的 2 次预算。
 - 全程 `auto` 模型。镜像固定 `ANTHROPIC_MODEL=auto_model/urm`、`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`，
   技能不覆盖模型或上下文配置。
 - SOLO2 账号只允许一个所属领域，子方向不锁。新建任务、写提示词和提交前都必须读取配置中的
@@ -34,11 +37,10 @@ description: >
   如果工程无法真实归入任一同大类子方向，直接拒绝提交。可以匹配时，只把大类保持为配置值，
   子方向填写实际匹配项。平台历史中的首条提交领域只用于交叉核验，不能反向授权跨域提交。
 - 难题只收「困难」「地狱」。首轮 170 字以内优先，绝对上限 240 字。
-- 结构不完整（401/API/网关报错、无最终 `end_turn`、无故中断）按规范重新 roll：
-  恢复初始快照 → 新容器 → 新会话，默认最多 3 次；仍失败就换题。结构完整但质量差的产物不重跑，如实评价。
-  结束标志不等于真的做完：`run`/`collect` 还会读最终回复和轨迹本身，最后一条还在向用户提问、
-  还在说"接下来我会…"、有工具调用没拿到结果、出现上下文耗尽或超时痕迹、回复断在句子中间的，
-  一律按未完成处理并重新 roll。判定结果写进 `attempts[].completion`。
+- 结构不完整时不再整题重跑。限流、网关 5xx、截断、空回复、继续许诺下一步或向用户提问，
+  由监督器等待后在原会话发送字面 `继续`；继续 2 次后仍不完整就终止并换题。
+  鉴权、额度或模型名问题原地保留并等待处理，超时后终止。
+  结束标志不等于真的做完：`run`/`collect` 还会读最终回复和轨迹本身。判定结果写进轮次记录与事件日志。
 - 录屏按用户可见功能判定，不按题目自称“纯后端”或改动文件位置判定。页面能够启动时，新增/修改页面、
   页面交互、页面展示字段或状态，或者后端结果需要在页面呈现时，正式录屏必须包含该页面从入口到对应功能结果的
   真实操作；只打开页面、页面返回 200 或仅验证接口都不算页面证据。若应用因真实启动错误在页面可达前就失败，
@@ -48,9 +50,10 @@ description: >
   模型自己的提交保留，不 squash，不 force-push/rebase。
 - `.gitignore` 自动补齐 `.env`、密钥、依赖目录和构建产物；发现疑似凭据被跟踪时 `init` 直接失败。
 - 轨迹和录屏当前在本地，Excel 填绝对路径；上传对象存储后再替换链接。
-- 「备注」默认保持为空，SOLO2 新建和返修 payload 默认剔除 `other_issues`。唯一例外是：提交前对
-  最终主会话轨迹做确定性明文 API Key 扫描，发现真实明文 Key 时，交付表「备注」和平台
-  `other_issues` 都固定写入 `轨迹中有存在明文apikey暴露风险`；扫描未命中时仍保持为空。
+- 「备注」默认保持为空，SOLO2 新建和返修 payload 默认剔除 `other_issues`。发生 1–2 次继续时，
+  交付表「备注」和平台 `other_issues` 写入
+  `模型运行中途中断，人工输入"继续"N次后完成`；提交前轨迹命中明文 API Key 风险时，
+  再接中文分号追加 `轨迹中有存在明文apikey暴露风险`。两句都没有时仍保持为空。
   平台表单缺少可用「备注」字段时必须停止提交。该备注不能记录 Key 原文、变量值、环境异常或其他补充说明。
 - SOLO2 自动提交默认开启，不再等待本地二次确认。`export` 完成门禁后会直接上传轨迹和录屏、
   提交并轮询质检；需要排障时可以显式运行 `submit --dry-run`，但正常交付路径不停在本地确认。
@@ -107,6 +110,19 @@ description: >
   但不交代由谁、在什么环境或用什么脚本执行；`feedback --check` 命中即阻断。
 - Feedback 正文不得使用“用户”作主语或指代；直接写业务对象、页面、任务、样本或结果，例如把
   “用户无法创建样本”写成“样本无法创建”；`feedback --check` 命中“用户”即阻断。
+
+## 收到“继续”时怎么做
+
+这里的“继续”是调用方对 Agent 的续跑指令，不是第二次题面。先执行：
+
+```bash
+python3 $S run-status --task-root ROOT --json
+python3 $S resume --task-root ROOT
+```
+
+以 `sessionRun`、`supervisor.log` 和实时轨迹为断点，从当前轮次继续监督或复核，不重新开始本题。
+如果命令返回 `accepted`，继续后续录屏、验证、Feedback、导出与提交；如果返回 `aborted` 或
+`session_lost`，保留现场并换题。不要因脚本断开、Agent 超时或工作台重启重新建容器。
 
 ## 出题规则
 
@@ -213,10 +229,13 @@ python3 $S config set submission.autoSubmit=true
    python3 $S run --task-root ROOT
    ```
 
-   官方镜像 `print` 模式逐字发送题面，默认超时 7200 秒。结束后导出完整 Claude projects 目录，
-   校验恰好一个主会话、题面字节一致、最终 `end_turn`、SessionID 和 PromptID；随后自动打产物快照、
-   生成 `delivery/轨迹时间线.md` 并快进推送同一仓库。
+   默认用受管交互模式启动官方镜像：`run` 在后台 tmux 中逐字发送题面后立即返回，
+   监督器独立轮询实时轨迹，对 429、5xx、截断等中断按规则发送字面 `继续`，最多 2 次。
+   调用方断开不影响监督器与容器。用 `run-status --json` 查看进度，用 `resume` 接回。
+   总时长默认 10800 秒，无进展或静默默认 1200 秒；退出开机会话后导出完整 Claude projects 目录，
+   校验题面、继续次数、最终轮次、SessionID 和 PromptID，再打产物快照、生成轨迹时间线并推送。
 
+   回退到无头模式时运行 `run --mode print`；该模式仍只有一次机会，没有自动继续能力。
    需要手工终端流程时用 `interactive`，结束后运行 `collect`。
 
 6. **读证据并真实复核**：
@@ -433,7 +452,14 @@ python3 $S prompt --task-root ROOT --file F --task-type T --difficulty 困难|�
   [--domain 领域 --sub-direction 子方向 --review FILE --difficulty-review FILE --allow-over-170]
 # 子方向必须属于所选领域；数据工程可选采集/RPA、数仓与数据湖、数据分析与数据应用。
 python3 $S repo --task-root ROOT [--name 前缀] [--private]
-python3 $S run --task-root ROOT [--attempts 3] [--timeout 7200] [--force] [--skip-repo]
+python3 $S run --task-root ROOT [--mode supervised|print] [--follow] [--timeout 10800] [--skip-repo]
+python3 $S run-status --task-root ROOT [--json] [--lines 20]
+python3 $S resume --task-root ROOT [--follow]
+python3 $S continue --task-root ROOT [--note TEXT]
+python3 $S abort --task-root ROOT --reason TEXT [--by human|auto]
+python3 $S resume-all [--tasks-dir DIR] [--dry-run]
+python3 $S doctor baseline [--tasks-dir DIR] [--out FILE]
+python3 $S doctor --fix-stale [--tasks-dir DIR]
 python3 $S interactive --task-root ROOT
 python3 $S collect --task-root ROOT [--container NAME]
 python3 $S reset --task-root ROOT --yes

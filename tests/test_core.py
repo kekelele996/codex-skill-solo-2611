@@ -117,7 +117,7 @@ def test_legacy_valid_domain_is_preserved():
         "defaults": {"domain": "游戏、图形与多媒体", "subDirection": "图形渲染"},
     }, ensure_ascii=False), encoding="utf-8")
     config = load_config()
-    assert config["configVersion"] == 3
+    assert config["configVersion"] == 4
     assert config["defaults"]["domain"] == "游戏、图形与多媒体"
     assert config["defaults"]["subDirection"] == "图形渲染"
 
@@ -130,7 +130,7 @@ def test_legacy_data_other_default_migrates_to_data_lake():
         "defaults": {"domain": "数据工程", "subDirection": "其他"},
     }, ensure_ascii=False), encoding="utf-8")
     config = load_config()
-    assert config["configVersion"] == 3
+    assert config["configVersion"] == 4
     assert config["defaults"]["domain"] == "数据工程"
     assert config["defaults"]["subDirection"] == "数仓与数据湖"
     path.unlink()

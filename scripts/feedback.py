@@ -392,6 +392,21 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
             )
     if score and score <= 2 and not negatives:
         errors.append(f"打了 {score} 分但文本里没有写明失败/缺失的具体表现")
+    if task_root is not None and state is not None and score == 5:
+        run = state.get("sessionRun") or {}
+        used = int((run.get("continues") or {}).get("used") or 0)
+        model_fault_kinds = {
+            str(item.get("kind") or "")
+            for item in run.get("interrupts") or []
+            if isinstance(item, dict)
+        }
+        model_fault_kinds |= {
+            str(item.get("kind") or "")
+            for item in run.get("rounds") or []
+            if isinstance(item, dict)
+        }
+        if used > 0 and model_fault_kinds & {"truncated", "incomplete", "empty"}:
+            errors.append("模型自身中断过的题不得评 5 分")
 
     process_match = re.search(r"过程问题[:：](.*?)(?:\n\s*产物问题[:：]|$)", feedback, re.S)
     process_text = process_match.group(1) if process_match else ""

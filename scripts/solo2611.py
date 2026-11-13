@@ -12,6 +12,7 @@ import string
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,11 @@ import excel  # noqa: E402
 import evidence  # noqa: E402
 import feedback as fb  # noqa: E402
 import github_repo as gh  # noqa: E402
+import doctor  # noqa: E402
 import recorder  # noqa: E402
 import prompting  # noqa: E402
+import resume as print_resume  # noqa: E402
+import session as managed  # noqa: E402
 import submission  # noqa: E402
 import trace as tr  # noqa: E402
 from common import (  # noqa: E402
@@ -52,6 +56,7 @@ COPY_IGNORE = shutil.ignore_patterns("node_modules", ".git", "dist", "build", ".
 SECRET_NAMES = (".env", "id_rsa", "id_ed25519", "credentials.json")
 PROMPT_HISTORY = STATE_HOME / "prompt-history.jsonl"
 CONTAINER_LOCK = STATE_HOME / "containers.lock"
+LAUNCH_LOCK = STATE_HOME / "launch.lock"
 
 
 def version() -> str:
@@ -436,6 +441,48 @@ def _docker_base(name: str, task_root: Path, ws: Path, image: str, interactive: 
     ]
 
 
+def _wait_launch_spacing(config: dict[str, Any]) -> None:
+    """Serialize container starts across agents using a monotonic wall stamp."""
+    spacing = max(5, int(config_get(config, "claude.launchSpacingSeconds") or 20))
+    with file_lock(LAUNCH_LOCK):
+        try:
+            previous = read_json(LAUNCH_LOCK, {}) or {}
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        last_at = 0.0
+        try:
+            last_at = float(previous.get("lastLaunchedEpoch") or 0)
+        except (TypeError, ValueError):
+            last_at = 0.0
+        remaining = max(0.0, spacing - (time.time() - last_at))
+        if remaining:
+            print(f"启动间隔保护：等待 {int(remaining + 0.999)} 秒", file=sys.stderr)
+            time.sleep(remaining)
+        write_json(
+            LAUNCH_LOCK,
+            {
+                "schema": "solo2611/launch-lock/1",
+                "lastLaunchedEpoch": time.time(),
+                "lastLaunchedAt": utc_now(),
+                "spacingSeconds": spacing,
+            },
+            mode=0o600,
+        )
+
+
+def _opportunity_consumed(state: dict[str, Any]) -> bool:
+    if state.get("session"):
+        return True
+    run_state = state.get("sessionRun") or {}
+    if run_state.get("status") in managed.TERMINAL:
+        return True
+    return any(
+        attempt.get("status") in {"running", "rejected", "cancelled", "aborted", "lost"}
+        for attempt in state.get("attempts") or []
+        if isinstance(attempt, dict)
+    )
+
+
 def _collect_container(task_root: Path, state: dict[str, Any], name: str, attempt_dir: Path,
                        result: dict[str, Any] | None = None) -> dict[str, Any]:
     traces = attempt_dir / "traces"
@@ -443,7 +490,14 @@ def _collect_container(task_root: Path, state: dict[str, Any], name: str, attemp
     proc = run(["docker", "cp", f"{name}:{CONTAINER_TRACE_DIR}", str(traces)], check=False, timeout=300)
     if proc.returncode != 0:
         raise Solo2611Error(f"导出轨迹失败，容器 {name} 已保留，不要删除：{proc.stderr.decode(errors='replace')}")
-    run(["docker", "rm", name], check=False, timeout=60)
+    removed = run(["docker", "rm", name], check=False, timeout=60)
+    if removed.returncode != 0:
+        inspect = run(["docker", "inspect", name], check=False, timeout=20)
+        if inspect.returncode == 0:
+            raise Solo2611Error(
+                f"轨迹已导出，但容器 {name} 删除失败，禁止标记为接受："
+                f"{removed.stderr.decode(errors='replace').strip()}"
+            )
     files = tr.main_trace_files(traces)
     prompt_text = Path(state["promptPath"]).read_text(encoding="utf-8")
     if len(files) != 1:
@@ -497,106 +551,198 @@ def cmd_run(args: argparse.Namespace) -> None:
     config = load_config()
     if not state.get("promptPath"):
         raise Solo2611Error("先运行 prompt")
-    if state.get("session") and not args.force:
-        raise Solo2611Error("这道题已有被接受的会话；一个 session 只算一条数据。确需重跑请加 --force（会丢弃现有产物）")
+    if state.get("session") or (state.get("sessionRun") or {}).get("status") == "accepted":
+        raise Solo2611Error("这道题已有被接受的会话；一题只有一次会话机会")
+    if (state.get("sessionRun") or {}).get("status") == "aborted" or state.get("status") == "session_aborted":
+        raise Solo2611Error("这道题已终止；终止是终态，只能换题")
+    if _opportunity_consumed(state) and (state.get("sessionRun") or {}).get("status") != "start_failed":
+        raise Solo2611Error("这道题已经用过会话机会；v4 不支持整题重跑")
     if sha256_file(Path(state["promptPath"])) != state["promptSha256"]:
         raise Solo2611Error("delivery/提示词.md 在 prompt 之后被改动过")
     _require_repo(state, args.skip_repo)
-    if args.force and state.get("session"):
-        state.pop("session", None)
-        state.pop("artifact", None)
-        _reset_workspace(state)
     _check_workspace_pristine(state)
     image = str(config_get(config, "claude.image"))
-    key = api_key(config)
     _ensure_image(image)
-    attempts = int(args.attempts or config_get(config, "claude.attempts") or 3)
-    timeout = float(args.timeout or config_get(config, "claude.timeoutSeconds") or 7200)
+    mode = str(args.mode or config_get(config, "claude.runMode") or "supervised")
+    if mode not in {"supervised", "print"}:
+        raise Solo2611Error("--mode 只能是 supervised 或 print")
+    if mode == "supervised":
+        ws = ws_of(state)
+        os.chmod(ws, 0o777)
+        attempt = managed.prepare_attempt(task_root, state, image)
+        save_state(task_root, state)
+        _wait_launch_spacing(config)
+        try:
+            result = managed.start_supervised(task_root, load_state(task_root), int(attempt["index"]))
+        except Exception as exc:
+            failed_state = load_state(task_root)
+            failed_run = failed_state.setdefault("sessionRun", {})
+            failed_run["status"] = "start_failed"
+            failed_run["error"] = f"{type(exc).__name__}: {exc}"
+            failed_state["status"] = "prompt_ready"
+            current = next(
+                (
+                    item
+                    for item in failed_state.get("attempts") or []
+                    if int(item.get("index") or 0) == int(attempt["index"])
+                ),
+                None,
+            )
+            if current is not None:
+                current["status"] = "start_failed"
+                current["startFailed"] = True
+            save_state(task_root, failed_state)
+            raise Solo2611Error(f"受管会话启动失败，不消耗会话机会：{exc}") from exc
+        emit(result)
+        if not args.follow:
+            return
+        while True:
+            status = managed.status_view(task_root)
+            emit(status)
+            if status["status"] in managed.TERMINAL or status["status"] == "session_lost":
+                if status["status"] != "accepted":
+                    raise SystemExit(2)
+                return
+            time.sleep(5)
+
+    # print is the conservative fallback: one container, one prompt, no continues.
+    key = api_key(config)
+    timeout = float(args.timeout or config_get(config, "claude.timeoutSeconds") or 10800)
+    silent = float(config_get(config, "claude.silentSeconds") or 1200)
     limit = int(config_get(config, "claude.maxContainers") or 4)
     env = os.environ.copy()
     env["apikey"] = key
     env["ANTHROPIC_BASE_URL"] = base_url(config) or DEFAULT_BASE_URL
     ws = ws_of(state)
     os.chmod(ws, 0o777)
-    for n in range(1, attempts + 1):
-        idx = len(state["attempts"]) + 1
-        attempt_dir = task_root / "monitor" / "runs" / f"attempt-{idx:02d}"
-        attempt_dir.mkdir(parents=True, exist_ok=True)
-        name = f"solo2611-{container_slug(state['taskName'])}-{idx:02d}-{random.randrange(16**4):04x}".lower()
-        attempt = {"index": idx, "container": name, "mode": "print", "image": image, "startedAt": utc_now(),
-                   "status": "running", "dir": str(attempt_dir)}
-        state["attempts"].append(attempt)
-        state["status"] = "running"
-        save_state(task_root, state)
-        cmd = _docker_base(name, task_root, ws, image, interactive=False) + ["print"]
-        with file_lock(CONTAINER_LOCK):
-            while len(_running_solo_containers()) >= limit:
-                print(f"容器已达上限 {limit}，等待名额…", file=sys.stderr)
-                time.sleep(10)
-            stdin = open(state["promptPath"], "rb")
-            stdout = open(attempt_dir / "stdout.jsonl", "wb")
-            stderr = open(attempt_dir / "stderr.log", "wb")
-            proc = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
-            for _ in range(60):
-                if _container_running(name) or proc.poll() is not None:
-                    break
-                time.sleep(0.5)
-        print(f"[attempt {idx}] 容器 {name} 运行中（超时 {int(timeout)} 秒）", file=sys.stderr)
-        started = time.monotonic()
-        cancelled = False
-        try:
-            while proc.poll() is None:
-                if time.monotonic() - started > timeout:
-                    attempt["timeout"] = True
-                    run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
-                    break
-                time.sleep(5)
-            proc.wait(timeout=120)
-        except KeyboardInterrupt:
-            cancelled = True
-            run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
-        finally:
-            stdin.close()
-            stdout.close()
-            stderr.close()
-        attempt["exitCode"] = proc.returncode
-        attempt["finishedAt"] = utc_now()
-        result = tr.stdout_result(attempt_dir / "stdout.jsonl")
-        attempt["result"] = result
-        info = _collect_container(task_root, state, name, attempt_dir, result)
-        attempt["completion"] = info.get("completion") or {}
-        if result.get("is_error"):
-            info["ok"] = False
-            info.setdefault("errors", []).append(f"print 模式返回错误: {result}")
-        if attempt.get("timeout"):
-            info["ok"] = False
-            info.setdefault("errors", []).append("超过单次超时上限")
-        attempt["errors"] = info.get("errors", [])
-        if cancelled:
-            attempt["status"] = "cancelled"
-            _reset_workspace(state)
-            state["status"] = "prompt_ready"
-            save_state(task_root, state)
-            raise Solo2611Error("已中断；workspace 已恢复到初始快照，轨迹留在 " + str(attempt_dir))
-        if info.get("ok"):
-            _accept_attempt(task_root, state, attempt, info)
-            emit({"ok": True, "attempt": idx, "sessionId": info["sessionId"], "promptId": info["promptId"],
-                  "artifactSha": state["artifact"]["sha"], "diffStat": state["artifact"]["shortStat"],
-                  "timeline": str(task_root / "delivery" / "轨迹时间线.md"), "next": "record"})
-            return
-        attempt["status"] = "rejected"
-        save_state(task_root, state)
-        print(f"[attempt {idx}] 不可用：{info.get('errors')}；按规范重新 roll（恢复初始快照 + 新容器 + 新会话）", file=sys.stderr)
-        if any("401" in e or "authenticat" in e.lower() for e in info.get("errors", [])):
-            state["status"] = "run_failed"
-            save_state(task_root, state)
-            raise Solo2611Error("网关鉴权失败（401），检查 claude.apiKey 是否为本期团队 Key")
-        _reset_workspace(state)
-        if n < attempts:
-            time.sleep(min(300, 30 * 2 ** (n - 1)))
-    state["status"] = "run_failed"
+    idx = len(state["attempts"]) + 1
+    attempt_dir = task_root / "monitor" / "runs" / f"attempt-{idx:02d}"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    name = f"solo2611-{container_slug(state['taskName'])}-{idx:02d}-{random.randrange(16**4):04x}".lower()
+    attempt = {
+        "index": idx,
+        "container": name,
+        "mode": "print",
+        "image": image,
+        "startedAt": utc_now(),
+        "status": "running",
+        "dir": str(attempt_dir),
+    }
+    state["attempts"].append(attempt)
+    state["status"] = "running"
+    state["sessionRun"] = {
+        "schema": "solo2611/session-run/1",
+        "mode": "print",
+        "attemptIndex": idx,
+        "container": name,
+        "status": "running",
+        "startedAt": utc_now(),
+        "continues": {"used": 0, "max": 0, "history": []},
+        "rounds": [],
+        "interrupts": [],
+        "abort": None,
+        "outcome": None,
+    }
     save_state(task_root, state)
-    raise Solo2611Error(f"{attempts} 次尝试都没有得到完整单轮（持续中断/报错时规范要求换题）")
+    cmd = _docker_base(name, task_root, ws, image, interactive=False) + ["print"]
+    with file_lock(CONTAINER_LOCK):
+        while len(_running_solo_containers()) >= limit:
+            print(f"容器已达上限 {limit}，等待名额…", file=sys.stderr)
+            time.sleep(10)
+        _wait_launch_spacing(config)
+        stdin = open(state["promptPath"], "rb")
+        stdout = open(attempt_dir / "stdout.jsonl", "wb")
+        stderr = open(attempt_dir / "stderr.log", "wb")
+        proc = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+        attempt["pid"] = proc.pid
+        save_state(task_root, state)
+        for _ in range(60):
+            if _container_running(name) or proc.poll() is not None:
+                break
+            time.sleep(0.5)
+    print(f"[attempt {idx}] 容器 {name} 运行中（总时限 {int(timeout)} 秒，静默时限 {int(silent)} 秒）", file=sys.stderr)
+    started = time.monotonic()
+    last_size = 0
+    last_progress = started
+    detached = False
+    try:
+        while proc.poll() is None:
+            current_size = (attempt_dir / "stdout.jsonl").stat().st_size
+            if current_size != last_size:
+                last_size = current_size
+                last_progress = time.monotonic()
+            if time.monotonic() - last_progress >= silent:
+                attempt["timeout"] = True
+                attempt["timeoutKind"] = "silent"
+                run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
+                break
+            if time.monotonic() - started >= timeout:
+                attempt["timeout"] = True
+                attempt["timeoutKind"] = "total"
+                run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
+                break
+            time.sleep(5)
+        proc.wait(timeout=120)
+    except KeyboardInterrupt:
+        if not args.hard_stop:
+            detached = True
+            attempt["detachedAt"] = utc_now()
+            state["status"] = "running"
+            save_state(task_root, state)
+    finally:
+        stdin.close()
+        stdout.close()
+        stderr.close()
+    if detached:
+        raise Solo2611Error(
+            "已脱离，容器和运行未终止；稍后执行 "
+            f"`python3 {Path(__file__).resolve()} resume --task-root {task_root}` 接回"
+        )
+    if args.hard_stop and proc.poll() is None:
+        run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
+        _reset_workspace(state)
+        state["status"] = "prompt_ready"
+        save_state(task_root, state)
+        raise Solo2611Error("--hard-stop 已立即终止容器并恢复工作区")
+    attempt["exitCode"] = proc.returncode
+    attempt["finishedAt"] = utc_now()
+    result = tr.stdout_result(attempt_dir / "stdout.jsonl")
+    attempt["result"] = result
+    info = _collect_container(task_root, state, name, attempt_dir, result)
+    attempt["completion"] = info.get("completion") or {}
+    if result.get("is_error"):
+        info["ok"] = False
+        info.setdefault("errors", []).append(f"print 模式返回错误: {result}")
+    if attempt.get("timeout"):
+        info["ok"] = False
+        info.setdefault("errors", []).append(
+            "超过静默时限" if attempt.get("timeoutKind") == "silent" else "超过总时长上限"
+        )
+    attempt["errors"] = info.get("errors", [])
+    if info.get("ok"):
+        _accept_attempt(task_root, state, attempt, info)
+        state = load_state(task_root)
+        state["sessionRun"]["status"] = "accepted"
+        state["sessionRun"]["outcome"] = {"acceptedAt": utc_now(), "remark": ""}
+        save_state(task_root, state)
+        emit({"ok": True, "attempt": idx, "sessionId": info["sessionId"], "promptId": info["promptId"],
+              "artifactSha": state["artifact"]["sha"], "diffStat": state["artifact"]["shortStat"],
+              "timeline": str(task_root / "delivery" / "轨迹时间线.md"), "next": "record"})
+        return
+    attempt["status"] = "rejected"
+    state = load_state(task_root)
+    state["status"] = "session_aborted"
+    state["sessionRun"]["status"] = "aborted"
+    state["sessionRun"]["abort"] = {
+        "reason": "print_validation_failed",
+        "detail": "；".join(info.get("errors") or []),
+        "at": utc_now(),
+        "by": "auto",
+    }
+    save_state(task_root, state)
+    raise Solo2611Error(
+        "print 会话不可用；v4 不重跑。错误：" + "；".join(info.get("errors") or ["结构校验失败"])
+    )
 
 
 def cmd_interactive(args: argparse.Namespace) -> None:
@@ -629,7 +775,7 @@ def cmd_interactive(args: argparse.Namespace) -> None:
         subprocess.run(["pbcopy"], input=Path(state["promptPath"]).read_bytes(), check=False)
     print("\n".join([
         "在 Mac 终端执行下面整行（Key 由配置读取，不会写进命令历史）：", "", line, "",
-        f"提示词已复制到剪贴板（原文：{state['promptPath']}），出现输入框后粘贴发送，只发这一次，不追问、不纠错。",
+        f"提示词已复制到剪贴板（原文：{state['promptPath']}），出现输入框后粘贴发送；手工模式不支持自动继续。",
         "模型回答结束后按两次 Ctrl+D 回到终端，然后执行：", "",
         f"python3 {script} collect --task-root {task_root}",
     ]))
@@ -659,13 +805,104 @@ def cmd_collect(args: argparse.Namespace) -> None:
     attempt["status"] = "rejected"
     state["status"] = "prompt_ready"
     save_state(task_root, state)
-    emit({"ok": False, "errors": info.get("errors"), "hint": "按规范重新 roll：先 `reset --yes` 再 `interactive`"})
+    emit({"ok": False, "errors": info.get("errors"), "hint": "该会话不可用；v4 不支持整题重跑，请换题"})
     raise SystemExit(2)
+
+
+def cmd_supervise(args: argparse.Namespace) -> None:
+    task_root = Path(args.task_root).resolve()
+    managed.supervisor_loop(task_root, int(args.attempt), attach=bool(args.attach))
+
+
+def cmd_run_status(args: argparse.Namespace) -> None:
+    task_root = Path(args.task_root).resolve()
+    status = managed.status_view(task_root, log_lines=max(1, int(args.lines or 20)))
+    if args.json:
+        emit(status)
+        return
+    next_action = status.get("nextActionAt") or "无"
+    active = "在线" if status.get("supervisorAlive") else "离线"
+    print(
+        f"状态：{status['status']}  第 {status['round']} 轮  "
+        f"继续 {status['continues']['used']}/{status['continues']['max']}\n"
+        f"最近活动：{status.get('lastActivityAt') or '未知'}  下次动作：{next_action}\n"
+        f"剩余时间：{status.get('remainingSeconds', 0)} 秒  监督器：{active}\n"
+        f"容器：{status.get('container') or '无'}  SessionID：{status.get('sessionId') or '无'}"
+    )
+    if status.get("blocked"):
+        print(f"等待人工处理：{status['blocked'].get('kind')}，截止 {status['blocked'].get('until')}")
+    for event in status.get("logTail") or []:
+        print(f"{event.get('at', '')} {event.get('event', '')}")
+
+
+def cmd_resume(args: argparse.Namespace) -> None:
+    task_root = Path(args.task_root).resolve()
+    result = managed.resume_session(task_root)
+    emit(result)
+    if not args.follow:
+        if not result.get("ok"):
+            raise SystemExit(2)
+        return
+    while True:
+        status = managed.status_view(task_root)
+        emit(status)
+        if status.get("status") in managed.TERMINAL or status.get("status") == "session_lost":
+            if status.get("status") != "accepted":
+                raise SystemExit(2)
+            return
+        time.sleep(5)
+
+
+def cmd_continue(args: argparse.Namespace) -> None:
+    result = managed.human_continue(Path(args.task_root).resolve(), note=args.note or "")
+    emit(result)
+    if not result.get("ok"):
+        raise SystemExit(2)
+
+
+def cmd_abort(args: argparse.Namespace) -> None:
+    result = managed.abort(
+        Path(args.task_root).resolve(),
+        args.reason,
+        by=args.by,
+        detail="人工执行 abort",
+    )
+    emit(result)
+    if not result.get("ok"):
+        raise SystemExit(2)
+
+
+def cmd_resume_all(args: argparse.Namespace) -> None:
+    config = load_config()
+    tasks_dir = Path(args.tasks_dir or config["tasksDir"]).expanduser().resolve()
+    result = managed.supervise_all(tasks_dir, dry_run=bool(args.dry_run))
+    emit(result)
+    if not result.get("ok"):
+        raise SystemExit(2)
+
+
+def cmd_doctor(args: argparse.Namespace) -> None:
+    config = load_config()
+    tasks_dir = Path(args.tasks_dir or config["tasksDir"]).expanduser().resolve()
+    if args.action == "baseline":
+        output = (
+            Path(args.out).expanduser().resolve()
+            if args.out
+            else tasks_dir / "monitor" / "baseline.json"
+        )
+        emit(doctor.write_baseline(tasks_dir, output))
+        return
+    if args.action == "fix-stale" or args.fix_stale:
+        emit(doctor.fix_stale(tasks_dir))
+        return
+    raise Solo2611Error("doctor 只支持 baseline 或 --fix-stale")
 
 
 def cmd_reset(args: argparse.Namespace) -> None:
     task_root = Path(args.task_root).resolve()
     state = load_state(task_root)
+    if state.get("session") or (state.get("sessionRun") or {}).get("status") in {"accepted", "aborted"}:
+        raise Solo2611Error("已接受或已终止的会话是终态，reset 不能改变它；请换题")
     if not args.yes:
         raise Solo2611Error("reset 会丢弃 workspace 里初始快照之后的全部改动，确认后加 --yes")
     _reset_workspace(state)
@@ -1054,6 +1291,12 @@ def build_row(task_root: Path) -> tuple[dict[str, Any], dict[str, Any], list[str
         if session.get("trace") and Path(session["trace"]).is_file()
         else {"risk": False, "signals": [], "remark": ""}
     )
+    submission_remark = tr.submission_remark(state, api_key_remark=trace_api_key_risk["remark"])
+    run_state = state.get("sessionRun") or {}
+    if run_state.get("status") == "aborted":
+        missing.append("会话已终止，终止的题不允许导出")
+    elif run_state and run_state.get("status") not in {None, "", "accepted"}:
+        missing.append("会话尚未进入可导出的终态")
     prompt = Path(state["promptPath"]).read_text(encoding="utf-8") if state.get("promptPath") else ""
     if state.get("promptPath"):
         prompt_path = Path(state["promptPath"])
@@ -1084,7 +1327,7 @@ def build_row(task_root: Path) -> tuple[dict[str, Any], dict[str, Any], list[str
         "运行录屏": rec.get("video", ""),
         "交付完整性": fbr["score"],
         "Feedback": fbr["feedback"],
-        "备注": trace_api_key_risk["remark"],
+        "备注": submission_remark,
     }
     optional = {"环境可复现等级", "备注"}
     if missing:  # feedback 已经报过缺失，不再重复列这两列
@@ -1320,13 +1563,56 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_prompt)
 
-    s = sub.add_parser("run", help="官方镜像 print 模式单轮执行（失败自动重新 roll）")
+    s = sub.add_parser("run", help="受管交互单轮执行（默认脱离；print 为回退）")
     s.add_argument("--task-root", required=True)
-    s.add_argument("--attempts", type=int)
+    s.add_argument("--mode", choices=["supervised", "print"])
+    s.add_argument("--attempts", type=int, help="兼容旧参数；v4 不再整题重跑")
     s.add_argument("--timeout", type=float)
     s.add_argument("--force", action="store_true")
     s.add_argument("--skip-repo", action="store_true", help="不要求初始快照已推送（本地试跑）")
+    s.add_argument("--follow", action="store_true", help="等待终态并持续输出进度")
+    s.add_argument("--hard-stop", action="store_true", help="Ctrl-C 时立即停止容器并恢复工作区")
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("run-status", help="查询受管会话进度")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--lines", type=int, default=20)
+    s.set_defaults(fn=cmd_run_status)
+
+    s = sub.add_parser("resume", help="幂等接回监督器或 print 容器")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--follow", action="store_true")
+    s.set_defaults(fn=cmd_resume)
+
+    s = sub.add_parser("continue", help="人工发送一次字面“继续”（计数）")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--note", help="仅写入事件日志，不发送给模型")
+    s.set_defaults(fn=cmd_continue)
+
+    s = sub.add_parser("abort", help="终止会话并保留现场")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--by", choices=["human", "auto"], default="human")
+    s.set_defaults(fn=cmd_abort)
+
+    s = sub.add_parser("resume-all", help="批量接回未结束会话")
+    s.add_argument("--tasks-dir")
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(fn=cmd_resume_all)
+
+    s = sub.add_parser("doctor", help="生成基线或修复历史悬空状态")
+    s.add_argument("action", nargs="?", choices=["baseline", "fix-stale"])
+    s.add_argument("--tasks-dir")
+    s.add_argument("--out")
+    s.add_argument("--fix-stale", action="store_true")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("supervise", help="内部入口：常驻监督一个会话")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--attempt", required=True, type=int)
+    s.add_argument("--attach", action="store_true")
+    s.set_defaults(fn=cmd_supervise)
 
     s = sub.add_parser("interactive", help="生成官方交互式启动命令（专家手动粘贴提示词）")
     s.add_argument("--task-root", required=True)
@@ -1447,7 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("record import 需要 --file")
     try:
         args.fn(args)
-    except Solo2611Error as exc:
+    except (Solo2611Error, OSError, RuntimeError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 1
     return 0

@@ -21,7 +21,14 @@ from common import SKILL_ROOT, non_space_len, sha256_bytes, write_json
 DIFFICULTY_TEMPLATE = SKILL_ROOT / "references" / "difficulty-review-template.json"
 RA_RENHUA_TEMPLATE = SKILL_ROOT / "references" / "ra-renhua-review-template.json"
 RA_RENHUA_REVISION = "7cbf47b57cbae0596d46c10c4a1445cbb27904b3"
-SOLO_ANNOTATION_SCRIPTS = SKILL_ROOT.parent / "solo-annotation-loop" / "scripts"
+_ANNOTATION_CANDIDATES = (
+    SKILL_ROOT.parent / "solo-annotation-loop" / "scripts",
+    SKILL_ROOT / "dependencies" / "solo-annotation-loop" / "scripts",
+)
+SOLO_ANNOTATION_SCRIPTS = next(
+    (path for path in _ANNOTATION_CANDIDATES if (path / "validate-prompt.py").is_file()),
+    _ANNOTATION_CANDIDATES[0],
+)
 
 MAX_PROMPT_CHARS = 240
 PREFERRED_PROMPT_CHARS = 170

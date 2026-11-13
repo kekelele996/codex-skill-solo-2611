@@ -36,7 +36,8 @@
 
 - SessionID：`...`
 - TurnID/PromptID：`...`
-- 运行模式：print / interactive；实际尝试次数：N
+- 运行模式：supervised / print；会话轮次：N；继续：M/2
+- 退出记录：accepted / aborted（原因）或无头回退结果
 - 轨迹：[<sessionId>.jsonl](/abs/.../traces/-workspace/<sessionId>.jsonl)
 - 轨迹时间线：[轨迹时间线.md](/abs/.../delivery/轨迹时间线.md)
 

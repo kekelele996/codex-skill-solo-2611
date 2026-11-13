@@ -1,4 +1,4 @@
-"""Claude Code 轨迹解析：定位主会话、单轮结构校验、确定性时间线（不做任何评价）。"""
+"""Claude Code 轨迹解析：定位主会话、多轮结构校验、确定性时间线（不做任何评价）。"""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from common import Solo2611Error
 
 
 PLAINTEXT_API_KEY_REMARK = "轨迹中有存在明文apikey暴露风险"
+CONTINUE_REMARK_TEMPLATE = '模型运行中途中断，人工输入"继续"{count}次后完成'
 
 _API_KEY_ASSIGNMENT = re.compile(
     r"(?i)\b(?:apikey|api_key|anthropic_auth_token|anthropic_api_key|openai_api_key|"
@@ -62,6 +63,17 @@ def detect_plaintext_api_key_risk(path: Path) -> dict[str, Any]:
         "signals": sorted(signals),
         "remark": PLAINTEXT_API_KEY_REMARK if signals else "",
     }
+
+
+def submission_remark(state: dict[str, Any], *, api_key_remark: str = "") -> str:
+    """Return the single authoritative delivery/platform remark string."""
+    count = int(((state.get("sessionRun") or {}).get("continues") or {}).get("used") or 0)
+    parts: list[str] = []
+    if count > 0:
+        parts.append(CONTINUE_REMARK_TEMPLATE.format(count=count))
+    if api_key_remark.strip():
+        parts.append(api_key_remark.strip())
+    return "；".join(parts)
 
 
 def main_trace_files(traces_dir: Path) -> list[Path]:
@@ -123,6 +135,10 @@ def _norm(text: str) -> str:
     return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").strip().splitlines())
 
 
+def _is_continue(event: dict[str, Any]) -> bool:
+    return "".join(_text_of(_content(event)).split()) == "继续"
+
+
 def _ts(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -131,24 +147,50 @@ def _ts(value: Any) -> datetime | None:
 
 
 def analyze(path: Path, prompt_text: str | None = None) -> dict[str, Any]:
-    events = load_events(path)
+    info = analyze_from_events(load_events(path), prompt_text=prompt_text)
+    info["path"] = str(path)
+    info["subagentFiles"] = [str(p) for p in subagent_files(path)]
+    return info
+
+
+def analyze_from_events(
+    events: list[dict[str, Any]],
+    prompt_text: str | None = None,
+    *,
+    tolerate_incomplete: bool = False,
+) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     session_ids = sorted({str(e["sessionId"]) for e in events if e.get("sessionId")})
     if len(session_ids) != 1:
         errors.append(f"轨迹中的 sessionId 不唯一: {session_ids}")
-    if path.stem not in session_ids:
-        warnings.append(f"文件名 {path.stem} 与 sessionId 不一致")
 
     prompts = [e for e in events if is_real_user_prompt(e)]
-    if len(prompts) != 1:
-        errors.append(f"真人 user prompt 数量为 {len(prompts)}，单轮数据必须恰好 1 条")
+    if not prompts:
+        errors.append("轨迹中没有真人 user prompt")
+    continues = prompts[1:]
+    if len(continues) > 2:
+        errors.append(f"真人输入“继续”有 {len(continues)} 条，超过上限 2 条")
     prompt_event = prompts[0] if prompts else {}
     prompt_id = str(prompt_event.get("promptId") or "")
     if prompts and not prompt_id:
-        errors.append("真人 user 消息缺少 promptId")
+        errors.append("首轮真人 user 消息缺少 promptId")
     if prompts and prompt_text is not None and _norm(_text_of(_content(prompt_event))) != _norm(prompt_text):
         errors.append("轨迹中的 prompt 与 delivery/提示词.md 不一致")
+    unknown_inputs: list[str] = []
+    for event in continues:
+        if not _is_continue(event):
+            unknown_inputs.append(_text_of(_content(event))[:120])
+        if not str(event.get("promptId") or ""):
+            errors.append("“继续”消息缺少 promptId")
+        position = events.index(event)
+        if not any(
+            later.get("type") == "assistant" and not later.get("isSidechain")
+            for later in events[position + 1 :]
+        ):
+            errors.append("“继续”之后没有新的 assistant 轮次")
+    if unknown_inputs:
+        errors.append("出现非“继续”的真人输入：" + "；".join(unknown_inputs))
 
     main_assistant = [e for e in events if e.get("type") == "assistant" and not e.get("isSidechain")]
     final = main_assistant[-1] if main_assistant else {}
@@ -156,10 +198,10 @@ def analyze(path: Path, prompt_text: str | None = None) -> dict[str, Any]:
     stop_reason = final_msg.get("stop_reason") if final_msg else None
     if not main_assistant:
         errors.append("轨迹里没有 assistant 消息")
-    elif final.get("isApiErrorMessage"):
+    elif final.get("isApiErrorMessage") and not tolerate_incomplete:
         errors.append(f"最终消息是 API 错误: {_text_of(final_msg.get('content'))[:200]}")
-    elif stop_reason != "end_turn":
-        errors.append(f"最终 assistant 的 stop_reason 为 {stop_reason}，不是 end_turn（模型中断，需要重新 roll）")
+    elif stop_reason != "end_turn" and not tolerate_incomplete:
+        errors.append(f"最终 assistant 的 stop_reason 为 {stop_reason}，不是 end_turn（模型中断）")
     api_errors = [e for e in main_assistant if e.get("isApiErrorMessage")]
     if api_errors and not final.get("isApiErrorMessage"):
         warnings.append(f"中途出现 {len(api_errors)} 次 API 错误消息，最终已恢复")
@@ -181,7 +223,6 @@ def analyze(path: Path, prompt_text: str | None = None) -> dict[str, Any]:
     stamps = [t for t in (_ts(e.get("timestamp")) for e in events) if t]
     duration = (max(stamps) - min(stamps)).total_seconds() if len(stamps) >= 2 else 0.0
     return {
-        "path": str(path),
         "ok": not errors,
         "errors": errors,
         "warnings": warnings,
@@ -194,7 +235,9 @@ def analyze(path: Path, prompt_text: str | None = None) -> dict[str, Any]:
         "toolUses": tool_uses,
         "assistantEvents": len(main_assistant),
         "durationSeconds": round(duration, 1),
-        "subagentFiles": [str(p) for p in subagent_files(path)],
+        "prompts": len(prompts),
+        "continues": len(continues),
+        "subagentFiles": [],
         "finalText": _text_of(final_msg.get("content")) if final_msg else "",
     }
 
@@ -251,9 +294,11 @@ def completion_review(path: Path, info: dict[str, Any], result: dict[str, Any] |
             errors.append(f"print 模式没有以 success 结束，subtype={result.get('subtype')}")
 
     events = load_events(path)
+    prompt_positions = [index for index, event in enumerate(events) if is_real_user_prompt(event)]
+    current_round = events[prompt_positions[-1] :] if prompt_positions else events
     tool_uses: set[str] = set()
     tool_results: set[str] = set()
-    for event in events:
+    for event in current_round:
         content = _content(event)
         if not isinstance(content, list):
             continue
@@ -328,11 +373,36 @@ def timeline_markdown(path: Path, info: dict[str, Any], diff_stat: str = "") -> 
                 if isinstance(b, dict) and b.get("type") == "tool_result":
                     results[str(b.get("tool_use_id"))] = b
 
+    continues = [event for event in events if is_real_user_prompt(event) and _is_continue(event)]
+    interrupt_kinds: list[str] = []
+    for event in continues:
+        position = events.index(event)
+        previous = next(
+            (
+                candidate
+                for candidate in reversed(events[:position])
+                if candidate.get("type") == "assistant" and not candidate.get("isSidechain")
+            ),
+            {},
+        )
+        message = previous.get("message") if isinstance(previous.get("message"), dict) else {}
+        text = _text_of(message.get("content"))
+        lowered = text.lower()
+        if previous.get("isApiErrorMessage") and ("429" in text or "rate limit" in lowered):
+            interrupt_kinds.append("限流")
+        elif previous.get("isApiErrorMessage"):
+            interrupt_kinds.append("网关错误")
+        elif message.get("stop_reason") == "max_tokens":
+            interrupt_kinds.append("截断")
+        else:
+            interrupt_kinds.append("中断")
     lines = [
         "# 轨迹时间线",
         "",
         "> 由脚本按原生轨迹逐条列出，只做机械摘录。feedback 结论必须回到原始 JSONL、产物 diff 和真实运行复核，再由标注专家定稿。",
         "",
+        f"会话共 {max(1, int(info.get('prompts') or 1))} 轮，继续 {len(continues)} 次"
+        + (f"（原因：{'、'.join(dict.fromkeys(interrupt_kinds))}）" if interrupt_kinds else ""),
         f"- SessionID：`{info.get('sessionId')}`",
         f"- TurnID/PromptID：`{info.get('promptId')}`",
         f"- Harness 版本：`{info.get('harnessVersion')}`（entrypoint `{info.get('entrypoint')}`）",
@@ -345,6 +415,13 @@ def timeline_markdown(path: Path, info: dict[str, Any], diff_stat: str = "") -> 
     ]
     step = 0
     for e in events:
+        if is_real_user_prompt(e) and _is_continue(e):
+            index = continues.index(e)
+            lines.append(
+                f"⏸ 第 {index + 1} 轮中断（{interrupt_kinds[index] if index < len(interrupt_kinds) else '中断'}）"
+                f" → 输入“继续”（第 {index + 1} 次）"
+            )
+            continue
         if e.get("type") != "assistant" or e.get("isSidechain"):
             continue
         content = _content(e)

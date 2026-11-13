@@ -28,10 +28,15 @@
 
 | 方式 | 命令 | 轨迹 `entrypoint` | 说明 |
 |---|---|---|---|
-| print（默认） | `run` | `sdk-cli` | 无头执行，提示词逐字从文件送入，可批量和并发；结构不完整时自动重新 roll |
-| interactive | `interactive` → 专家粘贴 → `collect` | `cli` | 与官方文档的手工流程逐字一致；适合需要和文档完全对齐的场景 |
+| 受管交互（默认） | `run` → tmux + 独立监督器 | `cli` | 逐字发送题面，轮询实时轨迹；中断时在同一会话发送字面 `继续`，最多 2 次，不整题重跑 |
+| print（回退） | `run --mode print` | `sdk-cli` | 无头执行，一次机会、无自动继续；用于交互 TUI 或容器环境不可用时的保守回退 |
+| 手工交互 | `interactive` → 专家粘贴 → `collect` | `cli` | 保留为专家排障入口；不提供自动继续 |
 
 两种方式的 `sessionId`、`promptId`、`version` 字段都齐全（实测）。
+
+受管交互额外把本机 `monitor/runs/attempt-NN/live` bind 到
+`/home/node/.claude/projects`，用于实时读取轨迹。Token 写入权限为 `0600` 的临时 `env.sh`；
+tmux 命令行、`ps` 输出和 `launch.sh` 都不包含 Key。题面发出后立即删除密钥临时文件。
 
 ## 轨迹结构（实测）
 

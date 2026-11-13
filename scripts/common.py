@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,14 +32,20 @@ DEFAULT_TASKS_DIR = Path.home() / "claude-runs" / "solo-2611"
 DEFAULT_BASE_URL = "https://llm2.jzxhnh.com"  # 镜像内置的 ANTHROPIC_BASE_URL
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "configVersion": 3,
+    "configVersion": 4,
     "claude": {
         "apiKey": "",
         "baseUrl": DEFAULT_BASE_URL,
         "image": DEFAULT_IMAGE,
         "maxContainers": 4,
-        "timeoutSeconds": 7200,
-        "attempts": 3,
+        "timeoutSeconds": 10800,
+        "silentSeconds": 1200,
+        "noProgressSeconds": 1200,
+        "launchSpacingSeconds": 20,
+        "runMode": "supervised",
+        "continueMax": 2,
+        "startAttempts": 2,
+        "fatalHoldMinutes": 30,
     },
     "tasksDir": str(DEFAULT_TASKS_DIR),
     "git": {"userName": "solo-2611", "userEmail": "solo-2611@local"},
@@ -126,6 +133,27 @@ def load_config() -> dict[str, Any]:
         if defaults.get("domain") == DEFAULT_DOMAIN and defaults.get("subDirection") == "其他":
             defaults["subDirection"] = DEFAULT_SUB_DIRECTION
         config["configVersion"] = 3
+    if int(config.get("configVersion") or 0) < 4:
+        claude = config.setdefault("claude", {})
+        # v4 只限制新会话能力，不修改磁盘上已有的任务或正在运行的容器。
+        claude.setdefault("runMode", "supervised")
+        claude.setdefault("continueMax", 2)
+        claude.setdefault("startAttempts", 2)
+        claude.setdefault("launchSpacingSeconds", 20)
+        claude.setdefault("silentSeconds", 1200)
+        claude.setdefault("noProgressSeconds", 1200)
+        claude.setdefault("fatalHoldMinutes", 30)
+        claude["timeoutSeconds"] = max(10800, int(claude.get("timeoutSeconds") or 10800))
+        config["configVersion"] = 4
+    claude = config.setdefault("claude", {})
+    claude["continueMax"] = min(2, max(0, int(claude.get("continueMax") or 0)))
+    claude["startAttempts"] = min(2, max(1, int(claude.get("startAttempts") or 2)))
+    claude["launchSpacingSeconds"] = max(5, int(claude.get("launchSpacingSeconds") or 20))
+    claude["silentSeconds"] = max(60, int(claude.get("silentSeconds") or 1200))
+    claude["noProgressSeconds"] = max(60, int(claude.get("noProgressSeconds") or 1200))
+    claude["fatalHoldMinutes"] = max(1, int(claude.get("fatalHoldMinutes") or 30))
+    if claude.get("runMode") not in {"supervised", "print"}:
+        claude["runMode"] = "supervised"
     return config
 
 
@@ -242,7 +270,19 @@ def state_path(task_root: Path) -> Path:
 
 
 def load_state(task_root: Path) -> dict[str, Any]:
-    state = read_json(state_path(task_root))
+    path = state_path(task_root)
+    lock_path = task_root / "monitor" / "state.lock"
+    state: Any = None
+    for attempt in range(3):
+        with file_lock(lock_path):
+            try:
+                state = read_json(path)
+            except (OSError, json.JSONDecodeError):
+                state = None
+        if isinstance(state, dict):
+            break
+        if attempt < 2:
+            time.sleep(0.05)
     if not isinstance(state, dict):
         raise Solo2611Error(f"不是 solo-2611 任务目录（缺少 monitor/state.json）: {task_root}")
     return state
@@ -250,7 +290,8 @@ def load_state(task_root: Path) -> dict[str, Any]:
 
 def save_state(task_root: Path, state: dict[str, Any]) -> None:
     state["updatedAt"] = utc_now()
-    write_json(state_path(task_root), state)
+    with file_lock(task_root / "monitor" / "state.lock"):
+        write_json(state_path(task_root), state)
 
 
 @contextmanager

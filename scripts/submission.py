@@ -416,6 +416,7 @@ def preflight(
     if not trace_info.get("ok"):
         raise Solo2611Error("轨迹结构校验未通过: " + "；".join(trace_info.get("errors") or []))
     trace_api_key_risk = tr.detect_plaintext_api_key_risk(trace_path)
+    submission_remark = tr.submission_remark(state, api_key_remark=trace_api_key_risk["remark"])
     video_path = Path(str((state.get("recording") or {}).get("video") or ""))
     if not video_path.is_file():
         raise Solo2611Error("录屏文件不存在")
@@ -435,10 +436,10 @@ def preflight(
         item
         for item in schema.get("fields") or []
         if item.get("is_enabled", True)
-        and not _is_excluded_submission_field(item, include_remark=trace_api_key_risk["risk"])
+        and not _is_excluded_submission_field(item, include_remark=bool(submission_remark))
     ]
-    if trace_api_key_risk["risk"] and not any(_is_remark_field(item) for item in fields):
-        raise Solo2611Error("轨迹存在明文 API Key 风险，但平台表单没有可用的「备注」字段，禁止提交")
+    if submission_remark and not any(_is_remark_field(item) for item in fields):
+        raise Solo2611Error("会话需要写入备注，但平台表单没有可用的「备注」字段，禁止提交")
     data: dict[str, Any] = {}
     file_values: dict[str, Path] = {}
     for field in fields:
@@ -451,7 +452,7 @@ def preflight(
             file_values[key] = video_path
             continue
         if _is_remark_field(field):
-            value = trace_api_key_risk["remark"]
+            value = submission_remark
         else:
             value = prompt if key == "user_prompt" else row.get(label)
         value = _coerce_value(field, value)
@@ -476,6 +477,7 @@ def preflight(
         "existingSubmission": existing,
         "trace": {"path": str(trace_path), "size": trace_path.stat().st_size, "sha256": sha256_file(trace_path)},
         "plaintextApiKeyRisk": trace_api_key_risk,
+        "remark": submission_remark,
         "video": {"path": str(video_path), **video_info, "sha256": sha256_file(video_path)},
         "accountDomainLock": domain_lock,
         "scoreDelivery": int(data.get("score_delivery") or 0),
@@ -485,7 +487,7 @@ def preflight(
     }
     out_dir = task_root / "monitor" / "submission"
     write_json(out_dir / "preflight.json", result, mode=0o600)
-    data = _sanitize_submission_data(data, include_remark=trace_api_key_risk["risk"])
+    data = _sanitize_submission_data(data, include_remark=bool(submission_remark))
     write_json(
         out_dir / "payload-preview.json",
         {
@@ -587,8 +589,10 @@ def submit_task(
         return result
     data, files, fingerprint = _payload_from_preview(task_root)
     trace_api_key_risk = tr.detect_plaintext_api_key_risk(files["trace_file"])
-    if trace_api_key_risk["risk"]:
-        data["other_issues"] = trace_api_key_risk["remark"]
+    state = load_state(task_root)
+    submission_remark = tr.submission_remark(state, api_key_remark=trace_api_key_risk["remark"])
+    if submission_remark:
+        data["other_issues"] = submission_remark
     else:
         data.pop("other_issues", None)
     if not execute:
@@ -599,6 +603,7 @@ def submit_task(
             "fields": sorted(data),
             "files": {key: {"path": str(path), "size": path.stat().st_size} for key, path in files.items()},
             "plaintextApiKeyRisk": trace_api_key_risk,
+            "remark": submission_remark,
             "preflight": str(task_root / "monitor" / "submission" / "preflight.json"),
         }
         _save_result(task_root, result)
@@ -710,25 +715,27 @@ def repair_task(
         raise Solo2611Error(f"提交 {submission_id} 不是可返修的 PENDING_FIX")
     _, files, fingerprint = _payload_from_preview(task_root)
     trace_api_key_risk = tr.detect_plaintext_api_key_risk(files["trace_file"])
+    state = load_state(task_root)
+    submission_remark = tr.submission_remark(state, api_key_remark=trace_api_key_risk["remark"])
     row = _read_delivery_row(task_root)
     schema = client.request("GET", "/api/v1/submissions/form-schema")
     current = detail.get("data") if isinstance(detail.get("data"), dict) else detail
     data: dict[str, Any] = {}
     locked = {str(item) for item in detail.get("locked_fields") or []}
-    if trace_api_key_risk["risk"] and not any(
+    if submission_remark and not any(
         item.get("is_enabled", True) and _is_remark_field(item)
         for item in schema.get("fields") or []
     ):
-        raise Solo2611Error("轨迹存在明文 API Key 风险，但平台表单没有可用的「备注」字段，禁止返修提交")
+        raise Solo2611Error("会话需要写入备注，但平台表单没有可用的「备注」字段，禁止返修提交")
     for field in schema.get("fields") or []:
         if not field.get("is_enabled", True):
             continue
-        if _is_excluded_submission_field(field, include_remark=trace_api_key_risk["risk"]):
+        if _is_excluded_submission_field(field, include_remark=bool(submission_remark)):
             continue
         key = str(field.get("field_key") or "")
         label = str(field.get("label") or "")
         if _is_remark_field(field):
-            data[key] = trace_api_key_risk["remark"]
+            data[key] = submission_remark
         elif key == "trace_file":
             data[key] = current.get(key) or detail.get("trace_file")
         elif key == "screencast":
@@ -750,12 +757,13 @@ def repair_task(
     if refresh_video:
         uploaded = client.upload(files["screencast"], "video")
         data["screencast"] = uploaded["url"]
-    data = _sanitize_submission_data(data, include_remark=trace_api_key_risk["risk"])
+    data = _sanitize_submission_data(data, include_remark=bool(submission_remark))
     preview = {
         "submissionId": submission_id,
         "schemaFingerprint": fingerprint,
         "accountDomainLock": domain_lock,
         "plaintextApiKeyRisk": trace_api_key_risk,
+        "remark": submission_remark,
         "data": data,
         "comment": comment,
     }

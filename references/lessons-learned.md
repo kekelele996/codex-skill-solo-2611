@@ -1,5 +1,20 @@
 # 实测记录
 
+## 2026-11-13 v4 受管交互探针
+
+- 已在隔离任务 `/tmp/solo2611-accept/2026-11-13-v4-interactive-probe-ujhv` 用官方镜像实测：
+  ① 中文、标点和引号经 `tmux send-keys -l` 逐字进入输入框；
+  ② `/home/node/.claude/projects` bind 成功并实时产生主会话 JSONL；
+  ③ 发送中按 `Ctrl-C` 后输入字面“继续”，轨迹继续增长。三项均通过。
+- 容器首次启动会先出现 Bypass Permissions 确认页，当前选项默认停在 `No, exit`。监督器必须先
+  `Down + Enter` 选择 `Yes, I accept`，不能仅凭屏幕出现 `Claude Code` 就判 REPL 就绪。
+- 本次镜像界面自报 Claude Code `2.1.319`，与 `VERSION.json` 中记录的 `2.1.303` 不一致；
+  交付时应以轨迹里的实际 `version` 为准，并在升级镜像后重新核对。
+- 在该版本 REPL 空闲时发送两次 `C-d` 没有退出；关闭已附着的 tmux 会话会向 docker 客户端
+  发送 EOF，容器随后以 `exited` 正常结束，实时 bind 的轨迹保持完整。收尾实现先尝试两次
+  `C-d`，5 秒未退出再关闭 tmux，避免固定等 60 秒。
+- 证据：`solo-auto/docs/v4/evidence/probe-interactive.json`。
+
 ## 2026-11-13 P4 同案材料归并被误判为困难
 
 - 一道“同一案件、同一材料类型按内容归并，保留主件并显示重复来源”的题通过了旧的三个信号门禁，

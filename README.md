@@ -1,8 +1,8 @@
 # codex-skill-solo-2611
 
-`solo-2611` v0.5.0：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
+`solo-2611` v0.6.0：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
 
-支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session、一轮有效交互，完成题面门禁、快照、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
+支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session；结构中断时只在原会话发送字面“继续”，最多 2 次。技能负责题面门禁、快照、受管会话、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
 
 ## 安装
 
@@ -16,6 +16,8 @@ rsync -a ./dependencies/solo-annotation-loop/ "$HOME/.codex/skills/solo-annotati
 ```
 
 Python 运行时需要：
+
+系统还需要 `tmux >= 3.0`；受管交互是 v0.6.0 的默认运行模式。
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -50,8 +52,8 @@ python3 "$S" config test
 
 ## 核心要求
 
-- 备注列始终为空，SOLO2 payload 不携带 `other_issues`。
-- 唯一例外是最终主会话轨迹命中明文 API Key 风险：此时交付表和 `other_issues` 固定写入
+- 备注默认留空，SOLO2 payload 不携带 `other_issues`。发生继续时备注写固定中断说明；
+  最终主会话轨迹命中明文 API Key 风险时，再接中文分号追加
   `轨迹中有存在明文apikey暴露风险`，不记录 Key 原文。
 - Feedback 必须基于真实轨迹、产物快照和 `verify` 运行记录；机器会做事实回查。
 - Feedback 还会按平台 V2 的轨迹能力上限审计；轨迹未运行完整业务链路时，不能写成已经验证或跑通。
