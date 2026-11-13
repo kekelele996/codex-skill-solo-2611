@@ -232,6 +232,7 @@ python3 $S config set submission.autoSubmit=true
    默认用受管交互模式启动官方镜像：`run` 在后台 tmux 中逐字发送题面后立即返回，
    监督器独立轮询实时轨迹，对 429、5xx、截断等中断按规则发送字面 `继续`，最多 2 次。
    调用方断开不影响监督器与容器。用 `run-status --json` 查看进度，用 `resume` 接回。
+   受管模式前置要求 `tmux >= 3.0` 且宿主机不是 Windows；不满足时显式阻断，可切回 print。
    总时长默认 10800 秒，无进展或静默默认 1200 秒；退出开机会话后导出完整 Claude projects 目录，
    校验题面、继续次数、最终轮次、SessionID 和 PromptID，再打产物快照、生成轨迹时间线并推送。
 

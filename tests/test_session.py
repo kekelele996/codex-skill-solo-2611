@@ -211,6 +211,18 @@ def test_trace_ignores_background_task_notifications(tmp_path: Path) -> None:
     assert info["prompts"] == 1
 
 
+def test_incremental_trace_reads_only_complete_new_lines(tmp_path: Path) -> None:
+    path = tmp_path / "trace.jsonl"
+    path.write_text('{"type":"user","n":1}\n{"type":"assistant"', encoding="utf-8")
+    reader = session.IncrementalTrace(path)
+    assert [item.get("n") for item in reader.read()] == [1]
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(',"n":2}\n')
+    assert [item.get("n") for item in reader.read()] == [2]
+    assert len(reader.events) == 2
+    assert reader.read() == []
+
+
 def test_continue_hard_limit_and_remark() -> None:
     assert session.CONTINUE_HARD_LIMIT == 2
     assert session.effective_continue_max({"claude": {"continueMax": 0}}) == 0

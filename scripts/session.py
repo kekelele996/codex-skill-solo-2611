@@ -18,11 +18,10 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, suppress
-from dataclasses import dataclass
+from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from common import (
     CONTAINER_TRACE_DIR,
@@ -370,6 +369,47 @@ def _trace_files(live: Path) -> list[Path]:
 def _latest_trace(live: Path) -> Path | None:
     files = _trace_files(live)
     return files[0] if files else None
+
+
+class IncrementalTrace:
+    """Read only newly appended complete JSONL lines."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.offset = 0
+        self.pending = b""
+        self.events: list[dict[str, Any]] = []
+        self.size = 0
+
+    def read(self) -> list[dict[str, Any]]:
+        try:
+            self.size = self.path.stat().st_size
+        except OSError:
+            return []
+        if self.size < self.offset:
+            self.offset = 0
+            self.pending = b""
+            self.events = []
+        if self.size == self.offset:
+            return []
+        added: list[dict[str, Any]] = []
+        with self.path.open("rb") as handle:
+            handle.seek(self.offset)
+            data = handle.read()
+            self.offset = handle.tell()
+        lines = (self.pending + data).split(b"\n")
+        self.pending = lines.pop()
+        for raw in lines:
+            if not raw.strip():
+                continue
+            try:
+                item = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(item, dict):
+                self.events.append(item)
+                added.append(item)
+        return added
 
 
 def _container_name(task_name: str, attempt: int) -> str:
@@ -1078,6 +1118,7 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
         last_growth_at = time.monotonic()
         last_heartbeat = time.monotonic()
         gateway_failures = sum(1 for item in session.get("rounds") or [] if item.get("kind") == "gateway")
+        trace_reader: IncrementalTrace | None = None
         try:
             if not prompt_sent and not _trace_files(live):
                 ready = wait_for_repl(str(session.get("tmuxSession") or ""), timeout=60)
@@ -1169,13 +1210,16 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     )
                 path = _latest_trace(live)
                 if path is not None:
-                    size = path.stat().st_size
+                    if trace_reader is None or trace_reader.path != path:
+                        trace_reader = IncrementalTrace(path)
+                    trace_reader.read()
+                    size = trace_reader.size
                     if size != last_size:
                         last_size = size
                         last_growth_at = now
                         _refresh_last_activity(state, progress=True)
                         save_state(task_root, state)
-                    events = tr.load_events(path)
+                    events = trace_reader.events
                     screen = capture_pane(str(session.get("tmuxSession") or ""), lines=30)
                     if events and session.get("status") not in {"holding", "manual_input"}:
                         if round_ended(
@@ -1469,8 +1513,3 @@ def supervise_all(tasks_dir: Path, *, dry_run: bool = False) -> dict[str, Any]:
                 item["error"] = str(exc)
         items.append(item)
     return {"ok": all(item.get("ok", True) for item in items), "dryRun": dry_run, "items": items}
-
-
-@contextmanager
-def _noop() -> Iterator[None]:
-    yield
