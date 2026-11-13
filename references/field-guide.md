@@ -20,10 +20,11 @@
 | 运行录屏 | `recording/运行录屏.mp4` 绝对路径 | 720p、≤90 秒；窗口 ID 证据和 cursor guard 同时保留 |
 | 交付完整性 | `delivery/feedback.md`（Agent 证据化起草、专家复核） | 1–5 整数；常规高质量上限为 4，5 需要严格满分审计 |
 | Feedback | `delivery/feedback.md`（Agent 证据化起草、专家复核） | 过程与产物都要有可核验事实 |
-| 备注 | 固定空值 | 任何情况下都不填写，也不提交到平台 |
+| 备注 | 最终主会话轨迹的明文 API Key 风险扫描 | 默认空值；命中时固定为 `轨迹中有存在明文apikey暴露风险` |
 
 SOLO2 实际提交时，`轨迹文件` 通过 `kind=trace` 上传，`运行录屏` 通过 `kind=video` 上传；
-其余字段按服务端 `form-schema` 的动态 label 映射，但 `other_issues`（备注）始终从 payload 中剔除。
+其余字段按服务端 `form-schema` 的动态 label 映射。`other_issues`（备注）默认从 payload 中剔除；
+只有当前主会话轨迹命中明文 API Key 风险时才写入固定说明，且不得写入 Key 原文。
 登录 Cookie/CSRF 只存 Keychain，不写交付表。
 
 第二个工作表「内部记录」只用于团队管理（任务目录、尝试次数、SHA、录屏时长、Feedback 检查警告等），提交时按需删除。

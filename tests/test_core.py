@@ -320,7 +320,19 @@ def test_account_domain_comes_only_from_locked_config_and_is_read_only():
         )
 
 
-def test_submission_payload_never_contains_other_issues(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("trace_text", "expected_remark"),
+    [
+        ("{}", None),
+        (
+            json.dumps({"content": "ANTHROPIC_AUTH_TOKEN=sk-examplePlaintextKey1234567890"}),
+            tr.PLAINTEXT_API_KEY_REMARK,
+        ),
+    ],
+)
+def test_submission_remark_only_for_plaintext_api_key_risk(
+    tmp_path, monkeypatch, trace_text, expected_remark
+):
     root = tmp_path / "task"
     delivery = root / "delivery"
     delivery.mkdir(parents=True)
@@ -328,7 +340,7 @@ def test_submission_payload_never_contains_other_issues(tmp_path, monkeypatch):
     trace_path = root / "trace.jsonl"
     video_path = root / "video.mp4"
     prompt_path.write_text("补齐列后重新分析影响范围。", encoding="utf-8")
-    trace_path.write_text("{}\n", encoding="utf-8")
+    trace_path.write_text(trace_text + "\n", encoding="utf-8")
     video_path.write_bytes(b"video")
     state = {
         "promptPath": str(prompt_path),
@@ -415,9 +427,12 @@ def test_submission_payload_never_contains_other_issues(tmp_path, monkeypatch):
 
     prepared = submission.preflight(root, server=client.server, locked_domain="数据工程")
     preview = json.loads((root / "monitor" / "submission" / "payload-preview.json").read_text(encoding="utf-8"))
-    assert prepared["fieldCount"] == 9
+    assert prepared["fieldCount"] == (10 if expected_remark else 9)
     assert prepared["accountDomainLock"]["effectiveDomain"] == "数据工程"
-    assert "other_issues" not in preview["data"]
+    if expected_remark:
+        assert preview["data"]["other_issues"] == expected_remark
+    else:
+        assert "other_issues" not in preview["data"]
 
     with pytest.raises(Solo2611Error, match="账号锁定领域"):
         submission.preflight(root, server=client.server, locked_domain="安全")
@@ -430,7 +445,10 @@ def test_submission_payload_never_contains_other_issues(tmp_path, monkeypatch):
         locked_domain="数据工程",
     )
     assert result["submissionId"] == 7
-    assert "other_issues" not in client.create_payload["data"]
+    if expected_remark:
+        assert client.create_payload["data"]["other_issues"] == expected_remark
+    else:
+        assert "other_issues" not in client.create_payload["data"]
 
     payload_path = root / "monitor" / "submission" / "payload-preview.json"
     stale = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -446,7 +464,10 @@ def test_submission_payload_never_contains_other_issues(tmp_path, monkeypatch):
         locked_domain="数据工程",
     )
     assert repaired["status"] == "fix_submitted"
-    assert "other_issues" not in client.update_payload["data"]
+    if expected_remark:
+        assert client.update_payload["data"]["other_issues"] == expected_remark
+    else:
+        assert "other_issues" not in client.update_payload["data"]
 
 
 def test_existing_submission_keeps_qc_passed_status(tmp_path, monkeypatch):
@@ -485,6 +506,7 @@ def _fill_prompt_evidence(root: Path, prompt: str) -> tuple[Path, Path]:
     review_path = Path(templates["raRenhuaReview"])
     data = json.loads(diff_path.read_text(encoding="utf-8"))
     data.update({
+        "schemaVersion": 2,
         "difficulty": "困难",
         "verdict": "困难",
         "reviewedBy": "test",
@@ -544,6 +566,73 @@ def _fill_prompt_evidence(root: Path, prompt: str) -> tuple[Path, Path]:
             "whyHard": "恢复点、订单版本和批次可见性必须同时成立，任何一处覆盖都会污染最终数据。",
             "visibleFailure": "重跑后订单数翻倍，或者批次完成后仍读到旧地址。",
         },
+        "difficultyContract": {
+            "schema": "platform-p4-v2",
+            "taskNature": "这是包含采集、处理水位、订单入库和对账读取的状态型管道恢复任务。",
+            "singleSurfaceChange": False,
+            "boundaries": [
+                {
+                    "name": "文件采集",
+                    "kind": "ingest",
+                    "source": "src/ingest.ts",
+                    "promptAnchor": "迟到数据会覆盖同一订单的新地址",
+                    "failureIfBroken": "订单会保留错误地址，后续入库和对账结果全部失真。",
+                },
+                {
+                    "name": "处理水位",
+                    "kind": "recovery",
+                    "source": "src/ingest.ts",
+                    "promptAnchor": "失败后续跑要从已处理水位继续",
+                    "failureIfBroken": "失败后从头重跑会重复写入订单并让批次状态倒退。",
+                },
+                {
+                    "name": "订单入库",
+                    "kind": "persistence",
+                    "source": "src/reconcile.ts",
+                    "promptAnchor": "重复执行同一批时不能新增订单",
+                    "failureIfBroken": "重复订单进入下游，批次计数和源库对账都会失真。",
+                },
+            ],
+            "stateTransition": {
+                "from": "文件开始采集且批次尚未进入可发布状态",
+                "to": "批次完成、订单入库且对账结果可见",
+                "observableSignal": "批次状态完成，重复运行后订单数不变，源库与入库没有未解释差异。",
+            },
+            "crossBoundaryContract": (
+                "文件采集、处理水位和订单入库必须围绕同一批次共同推进，"
+                "任何一个边界单独成功都不能提前发布结果。"
+            ),
+            "mediumAlternative": (
+                "如果只修文件顺序追加、补一张结果表或增加一次字段判断，"
+                "平台会把它判为单点数据处理任务。"
+            ),
+            "nonRoutineDelta": (
+                "同一批重跑时，文件采集、处理水位和订单入库之间要做跨边界协调，"
+                "失败恢复后还要避免迟到乱序覆盖并保持对账一致。"
+            ),
+            "independentRisks": [
+                {
+                    "kind": "idempotency",
+                    "promptAnchor": "重复执行同一批时不能新增订单",
+                    "businessConsequence": "重跑产生重复订单，批次数量和下游对账都会失真。",
+                },
+                {
+                    "kind": "failure-recovery",
+                    "promptAnchor": "失败后续跑要从已处理水位继续",
+                    "businessConsequence": "失败后从头处理会重复记账，并让批次状态无法可靠恢复。",
+                },
+                {
+                    "kind": "late-data",
+                    "promptAnchor": "迟到数据会覆盖同一订单的新地址",
+                    "businessConsequence": "旧地址覆盖新地址后，订单和处理结果会长期错误。",
+                },
+                {
+                    "kind": "cross-system-reconciliation",
+                    "promptAnchor": "对账结果要能看出源库和入库的差异",
+                    "businessConsequence": "差异不可见时，错误入库会持续进入后续业务报表。",
+                },
+            ],
+        },
     })
     diff_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     review = json.loads(review_path.read_text(encoding="utf-8"))
@@ -555,6 +644,291 @@ def _fill_prompt_evidence(root: Path, prompt: str) -> tuple[Path, Path]:
     return diff_path, review_path
 
 
+def _write_p4_difficulty(
+    root: Path,
+    prompt: str,
+    *,
+    boundary_names: list[str],
+    boundary_kinds: list[str],
+    boundary_anchors: list[str],
+    risks: list[tuple[str, str]],
+) -> Path:
+    workspace = root / "workspace"
+    (workspace / "src").mkdir(parents=True, exist_ok=True)
+    for name in ("ingest.py", "state.py", "publish.py"):
+        (workspace / "src" / name).write_text(f"VALUE = {name!r}\n", encoding="utf-8")
+    sources = ["src/ingest.py", "src/state.py", "src/publish.py"]
+    boundaries = [
+        {
+            "name": name,
+            "kind": kind,
+            "source": sources[index],
+            "promptAnchor": boundary_anchors[index],
+            "failureIfBroken": f"{name}失效会让批次结果和业务状态不可信，必须阻断发布。",
+        }
+        for index, (name, kind) in enumerate(zip(boundary_names, boundary_kinds))
+    ]
+    risk_kinds = [kind for kind, _anchor in risks]
+    difficulty = {
+        "schemaVersion": 2,
+        "difficulty": "困难",
+        "signals": {
+            "multiModule": {
+                "passed": True,
+                "modules": boundary_names,
+                "crossModuleInvariant": "批次状态、订单版本和发布结果必须由同一处理水位共同约束。",
+                "evidence": "现有采集、状态推进和结果发布代码共同决定批次何时可见。",
+            },
+            "designTradeoff": {
+                "passed": True,
+                "conflict": "迟到数据要保留新版本，同时失败恢复和重跑不能让批次重复发布。",
+                "decision": "按来源时间裁决版本，并用持久化水位和发布状态共同约束完成条件。",
+                "whyNotRoutine": "这不是补一个状态字段，恢复、版本和发布必须同时保持一致。",
+                "evidence": "现有采集入口、状态存储和发布结果之间存在真实先后依赖。",
+            },
+            "complexConcern": {
+                "passed": True,
+                "kinds": risk_kinds,
+                "technicalRisk": "恢复点、订单版本和发布可见性可能互相覆盖，造成重复或旧数据进入下游。",
+                "observableFailure": "批次可能显示完成，但订单重复、版本倒退或对账出现无法解释的差异。",
+                "evidence": "题面原句和现有状态型数据流都包含这些可观察失败后果。",
+            },
+        },
+        "platformSignals": {
+            "multiModule": {
+                "answer": "任务同时涉及订单采集、处理水位和结果发布，多个运行责任必须共同完成。",
+                "promptQuote": boundary_anchors[0],
+                "ifViolated": "只完成一段会导致批次状态与订单结果互相矛盾。",
+            },
+            "designTradeoff": {
+                "answer": "必须在保留新版本、失败恢复和避免重复发布之间确定统一事实来源。",
+                "promptQuote": boundary_anchors[1],
+                "ifViolated": "恢复或重跑会覆盖正确版本，并让重复结果进入下游。",
+            },
+            "complexConcern": {
+                "answer": "恢复、重跑、版本裁决和发布可见性需要跨持久化与下游边界协调。",
+                "promptQuote": boundary_anchors[2],
+                "ifViolated": "批次可能提前完成，或者恢复后订单和对账结果不一致。",
+            },
+        },
+        "crossObjectInvariant": {
+            "objects": ["订单", "批次"],
+            "invariant": "同一批次中的订单版本、处理水位和发布状态必须来自同一次一致的处理结果。",
+            "divergenceFailure": "订单数和版本不一致时，批次会错误完成并污染下游报表。",
+        },
+        "projectEvidence": {
+            "files": sources[:2],
+            "existingFlow": "现有流程先采集订单，再推进持久化状态，最后发布可读取的批次结果。",
+            "whyNotRoutine": "题目同时改变恢复、版本裁决和发布结果，不是新增字段或筛选条件。",
+        },
+        "substantiveComplexity": {
+            "kinds": risk_kinds,
+            "promptQuote": risks[0][1],
+            "whyHard": "恢复点、订单版本和发布可见性必须同时成立，任何一处错位都会污染最终结果。",
+            "visibleFailure": "重跑后订单重复，或者恢复后旧版本重新进入已发布结果。",
+        },
+        "difficultyContract": {
+            "schema": "platform-p4-v2",
+            "taskNature": "这是跨采集、持久化、恢复和结果发布的状态型管道任务。",
+            "singleSurfaceChange": False,
+            "boundaries": boundaries,
+            "stateTransition": {
+                "from": "订单开始采集且批次处于处理中",
+                "to": "批次完成并发布唯一一致的订单结果",
+                "observableSignal": "批次状态完成，订单数稳定，重复执行后结果不变且对账一致。",
+            },
+            "crossBoundaryContract": (
+                f"{boundary_names[0]}、{boundary_names[1]}和{boundary_names[2]}必须共享同一处理水位，"
+                "只有订单版本、恢复状态和发布结果全部一致时批次才能完成。"
+            ),
+            "mediumAlternative": (
+                "如果只补一个判重字段、页面说明或结果表，任务仍会在单次运行时完成，平台会判为中等。"
+            ),
+            "nonRoutineDelta": (
+                f"同一批重跑时，{boundary_names[0]}、{boundary_names[1]}和{boundary_names[2]}"
+                "要做跨边界协调，失败恢复后还要避免迟到乱序覆盖并保持对账一致。"
+            ),
+            "independentRisks": [
+                {
+                    "kind": kind,
+                    "promptAnchor": anchor,
+                    "businessConsequence": "该风险发生后会让订单、批次或下游结果出现可见错误。",
+                }
+                for kind, anchor in risks
+            ],
+        },
+        "mediumShapeDefense": "",
+        "hellSignal": {"passed": False, "kinds": [], "reason": "", "evidence": ""},
+        "routineOnly": False,
+        "verdict": "困难",
+        "reviewedBy": "test",
+    }
+    path = root / "difficulty.json"
+    path.write_text(json.dumps(difficulty, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize(
+    ("label", "clauses", "boundary_kinds", "risks"),
+    [
+        (
+            "stateful-pipeline",
+            [
+                "订单处理从采集开始时先保留上一版批次结果",
+                "发布失败后要恢复旧版结果再继续处理",
+                "批次完成时订单状态、失败状态和发布状态都要能回读",
+            ],
+            ["ingest", "publication", "downstream"],
+            [("atomic-cutover", "发布失败后要恢复旧版结果再继续处理"),
+             ("failure-recovery", "发布失败后要恢复旧版结果再继续处理")],
+        ),
+        (
+            "failure-resume",
+            [
+                "订单处理开始后按已确认水位向前推进批次",
+                "处理失败后必须从已处理水位续跑",
+                "批次恢复后对账要核对源库与入库差异",
+            ],
+            ["ingest", "recovery", "accounting"],
+            [("failure-recovery", "处理失败后必须从已处理水位续跑"),
+             ("cross-system-reconciliation", "批次恢复后对账要核对源库与入库差异")],
+        ),
+        (
+            "rerun-idempotency",
+            [
+                "同一批订单重跑时不能新增订单",
+                "重复执行同一批后批次订单数保持一致",
+                "处理失败后要恢复水位并继续前移",
+            ],
+            ["ingest", "persistence", "recovery"],
+            [("idempotency", "重复执行同一批后批次订单数保持一致"),
+             ("failure-recovery", "处理失败后要恢复水位并继续前移")],
+        ),
+        (
+            "late-data",
+            [
+                "迟到的订单记录不能覆盖同一订单的新地址",
+                "处理时要按来源时间裁决批次版本",
+                "处理失败后要从已处理水位续跑",
+            ],
+            ["ingest", "processing", "recovery"],
+            [("late-data", "迟到的订单记录不能覆盖同一订单的新地址"),
+             ("failure-recovery", "处理失败后要从已处理水位续跑")],
+        ),
+        (
+            "reconciliation",
+            [
+                "对账结果要核对源库和入库的订单差异",
+                "对账失败后要能从已处理位置续跑",
+                "重复执行同一批时不能重复记账并更新批次状态",
+            ],
+            ["ingest", "recovery", "persistence"],
+            [("cross-system-reconciliation", "对账结果要核对源库和入库的订单差异"),
+             ("failure-recovery", "对账失败后要能从已处理位置续跑")],
+        ),
+    ],
+)
+def test_p4_contract_accepts_real_stateful_tasks(
+    tmp_path: Path, label: str, clauses: list[str], boundary_kinds: list[str],
+    risks: list[tuple[str, str]],
+) -> None:
+    prompt = "。".join(clauses) + "。"
+    path = _write_p4_difficulty(
+        tmp_path / label,
+        prompt,
+        boundary_names=["订单采集", "处理水位", "订单入库"],
+        boundary_kinds=boundary_kinds,
+        boundary_anchors=clauses,
+        risks=risks,
+    )
+    result = prompting._validate_difficulty(
+        path, task_root=tmp_path / label, prompt_text=prompt, difficulty="困难"
+    )
+    assert result["ok"], result["errors"]
+    assert result["p4Contract"]["schema"] == "platform-p4-v2"
+    assert len(result["p4Contract"]["independentBoundaryKinds"]) >= 2
+    assert len(result["p4Contract"]["independentRisks"]) == len(risks)
+
+
+def test_p4_idempotency_excludes_repeated_input_delivery():
+    pattern = prompting.COMPLEXITY_PATTERNS["idempotency"]
+    assert not pattern.search("同一案件重复投递后不新增文件")
+    assert not pattern.search("输入重复后不新增记录")
+    assert pattern.search("重复执行同一批时不能新增订单")
+    assert pattern.search("断点续跑后不能重复记账")
+
+
+def test_ui_boundary_kind_is_rejected(tmp_path):
+    prompt = "订单开始采集，处理失败后从水位续跑，重复执行同一批时不能新增订单。"
+    path = _write_p4_difficulty(
+        tmp_path,
+        prompt,
+        boundary_names=["订单采集", "处理水位", "订单入库"],
+        boundary_kinds=["ingest", "recovery", "persistence"],
+        boundary_anchors=["订单开始采集", "处理失败后从水位续跑", "重复执行同一批时不能新增订单"],
+        risks=[("failure-recovery", "处理失败后从水位续跑"),
+               ("idempotency", "重复执行同一批时不能新增订单")],
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["difficultyContract"]["boundaries"][1].update({"name": "工作台页面", "kind": "page"})
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    result = prompting._validate_difficulty(
+        path, task_root=tmp_path, prompt_text=prompt, difficulty="困难"
+    )
+    assert not result["ok"]
+    assert any("不在边界白名单" in error for error in result["errors"])
+    assert any("不能算独立责任边界" in error for error in result["errors"])
+
+
+def test_p4_rejects_discarded_material_merge_even_with_three_modules(tmp_path):
+    prompt = (
+        "同一案件的一份材料常从共享盘、邮箱、移动盘重复投递，文件名和拍摄日期会变。"
+        "现在判重只在目标名相同时生效，日期一变就多归档一份，材料数和移交数虚增；"
+        "不同案件共用一张证件时又不能误删。请按同一案件、同一材料类型的内容归并，"
+        "保留一份主件并显示重复来源，不同内容仍分别保留，重复投递后不新增文件也不改换主件，"
+        "工作台要显示主件、重复来源和判定依据。"
+    )
+    clauses = [
+        "同一案件的一份材料常从共享盘、邮箱、移动盘重复投递，文件名和拍摄日期会变",
+        "现在判重只在目标名相同时生效",
+        "工作台要显示主件、重复来源和判定依据",
+    ]
+    path = _write_p4_difficulty(
+        tmp_path,
+        prompt,
+        boundary_names=["判重规则", "工作台展示", "重复来源结果表"],
+        boundary_kinds=["persistence", "publication", "publication"],
+        boundary_anchors=clauses,
+        risks=[("idempotency", "重复投递后不新增文件"),
+               ("ordering", "文件名和拍摄日期会变")],
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert all(data["signals"][key]["passed"] for key in prompting.PLATFORM_SIGNAL_KEYS)
+    assert len(data["signals"]["multiModule"]["modules"]) == 3
+    assert len(data["projectEvidence"]["files"]) == 2
+    data["difficultyContract"]["nonRoutineDelta"] = (
+        "同一批重跑和失败恢复后展示去重结果，仍然只是补一次数据判重和页面说明。"
+    )
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    result = prompting._validate_difficulty(
+        path, task_root=tmp_path, prompt_text=prompt, difficulty="困难"
+    )
+    assert result["signalsPassed"] == 3
+    assert not result["ok"]
+    assert any("idempotency 风险正则" in error for error in result["errors"])
+    assert any("boundary“重复来源结果表”" in error for error in result["errors"])
+    assert any("nonRoutineDelta 必须点名至少两个运行边界" in error for error in result["errors"])
+
+
+def test_difficulty_template_is_p4_v2():
+    data = json.loads(prompting.DIFFICULTY_TEMPLATE.read_text(encoding="utf-8"))
+    assert data["schemaVersion"] == 2
+    assert data["difficultyContract"]["schema"] == "platform-p4-v2"
+    assert data["difficultyContract"]["singleSurfaceChange"] is False
+    assert len(data["difficultyContract"]["boundaries"]) >= 3
+    assert len(data["difficultyContract"]["independentRisks"]) >= 2
+
+
 def test_trace_analyze(tmp_path):
     good = _write_trace(tmp_path / "a", "s-1", PROMPT)
     info = tr.analyze(good, PROMPT)
@@ -563,6 +937,89 @@ def test_trace_analyze(tmp_path):
     bad = _write_trace(tmp_path / "b", "s-2", PROMPT, end="max_tokens")
     assert not tr.analyze(bad, PROMPT)["ok"]
     assert not tr.analyze(good, PROMPT + "改过")["ok"]
+
+
+def test_trace_detects_plaintext_api_key_without_treating_placeholders_as_risk(tmp_path):
+    risky = tmp_path / "risky.jsonl"
+    risky.write_text(
+        json.dumps({"content": "Authorization: Bearer sk-examplePlaintextKey1234567890"}) + "\n",
+        encoding="utf-8",
+    )
+    safe = tmp_path / "safe.jsonl"
+    safe.write_text(
+        json.dumps({
+            "content": (
+                "ANTHROPIC_AUTH_TOKEN=<redacted>\n"
+                "OPENAI_API_KEY=${OPENAI_API_KEY}\n"
+                'API_KEY = os.getenv("API_KEY")'
+            )
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    assert tr.detect_plaintext_api_key_risk(risky) == {
+        "risk": True,
+        "signals": ["api_key_prefix", "authorization_bearer"],
+        "remark": tr.PLAINTEXT_API_KEY_REMARK,
+    }
+    assert tr.detect_plaintext_api_key_risk(safe)["risk"] is False
+
+
+def test_build_row_writes_fixed_remark_for_plaintext_api_key_risk(tmp_path, monkeypatch):
+    root = tmp_path / "task"
+    delivery = root / "delivery"
+    monitor = root / "monitor" / "prompt"
+    delivery.mkdir(parents=True)
+    monitor.mkdir(parents=True)
+    prompt_path = delivery / "提示词.md"
+    prompt_path.write_text(PROMPT, encoding="utf-8")
+    trace_path = root / "traces" / "-workspace" / "s-risk.jsonl"
+    trace_path.parent.mkdir(parents=True)
+    trace_path.write_text(
+        json.dumps({"content": "ANTHROPIC_AUTH_TOKEN=sk-examplePlaintextKey1234567890"}) + "\n",
+        encoding="utf-8",
+    )
+    review_path = root / "review.json"
+    difficulty_path = root / "difficulty.json"
+    review_path.write_text("{}", encoding="utf-8")
+    difficulty_path.write_text("{}", encoding="utf-8")
+    (monitor / "validation.json").write_text('{"ok": true}', encoding="utf-8")
+    state = {
+        "promptPath": str(prompt_path),
+        "promptSha256": cli.sha256_file(prompt_path),
+        "promptReview": str(review_path),
+        "difficultyReview": str(difficulty_path),
+        "fields": {
+            "所属领域": "数据工程",
+            "子方向": "数仓与数据湖",
+            "任务类型": "功能开发",
+            "任务难度": "困难",
+            "语言/框架": "Python",
+            "Harness": "Claude Code",
+            "操作系统": "MacOS/Linux",
+        },
+        "session": {"trace": str(trace_path), "sessionId": "s-risk", "promptId": "p-risk"},
+        "initialSha": "a" * 40,
+        "artifact": {"sha": "b" * 40},
+        "recording": {"video": str(root / "video.mp4")},
+    }
+    (root / "video.mp4").write_bytes(b"video")
+    monkeypatch.setattr(cli, "load_state", lambda _root: state)
+    monkeypatch.setattr(
+        cli.fb,
+        "check",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "score": 4,
+            "feedback": "过程与产物均已核对。",
+            "warnings": [],
+        },
+    )
+    monkeypatch.setattr(cli.gh, "permalink", lambda _state, _sha: "https://example/commit/" + "a" * 40)
+
+    row, _internal, _missing = cli.build_row(root)
+
+    assert row["备注"] == tr.PLAINTEXT_API_KEY_REMARK
 
 
 def _trace_with_final(tmp_path: Path, name: str, final: str, *, drop_result: bool = False) -> Path:
@@ -1069,7 +1526,11 @@ def test_end_to_end(tmp_path, capsys):
     assert ".env" not in subprocess.run(["git", "-C", str(ws), "ls-files"], capture_output=True, text=True).stdout
 
     assert _run("prompt", "--task-root", str(root), "--init") == 0
-    assert (root / "monitor" / "prompt" / "difficulty-review.json").is_file()
+    difficulty_template = root / "monitor" / "prompt" / "difficulty-review.json"
+    assert difficulty_template.is_file()
+    generated_difficulty = json.loads(difficulty_template.read_text(encoding="utf-8"))
+    assert generated_difficulty["schemaVersion"] == 2
+    assert generated_difficulty["difficultyContract"]["schema"] == "platform-p4-v2"
     assert (root / "monitor" / "prompt" / "ra-renhua-review.json").is_file()
     pf = tmp_path / "p.md"
     pf.write_text(PROMPT, encoding="utf-8")
@@ -1077,6 +1538,9 @@ def test_end_to_end(tmp_path, capsys):
     assert _run("prompt", "--task-root", str(root), "--file", str(pf), "--task-type", "功能开发", "--difficulty", "困难",
                 "--lang", "TypeScript, PostgreSQL", "--sub-direction", "数据分析与数据应用") == 0
     assert load_state(root)["fields"]["子方向"] == "数据分析与数据应用"
+    validation = json.loads((root / "monitor" / "prompt" / "validation.json").read_text(encoding="utf-8"))
+    assert validation["p4Contract"]["schema"] == "platform-p4-v2"
+    assert len(validation["p4Contract"]["boundaries"]) == 3
     with pytest.raises(SystemExit):  # 同一提示词在另一题里会被查重拦下
         _run("init", "--task-name", "dup", "--source", str(src), "--tasks-dir", str(tasks))
         other = sorted(tasks.iterdir())[-1]

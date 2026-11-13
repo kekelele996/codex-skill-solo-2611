@@ -11,6 +11,59 @@ from typing import Any
 from common import Solo2611Error
 
 
+PLAINTEXT_API_KEY_REMARK = "轨迹中有存在明文apikey暴露风险"
+
+_API_KEY_ASSIGNMENT = re.compile(
+    r"(?i)\b(?:apikey|api_key|anthropic_auth_token|anthropic_api_key|openai_api_key|"
+    r"dashscope_api_key|deepseek_api_key|gemini_api_key|google_api_key|azure_openai_api_key)"
+    r"\b[\"']?\s*[:=]\s*[\"']?([^\s\"'\\,}]+)"
+)
+_API_KEY_PREFIX = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"sk-ant-[A-Za-z0-9_-]{12,}|"
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"AIza[0-9A-Za-z_-]{30,}|"
+    r"AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,}|"
+    r"github_pat_[A-Za-z0-9_]{20,}"
+    r")"
+)
+_AUTHORIZATION_BEARER = re.compile(r"(?i)\bauthorization\b[\"']?\s*[:=]\s*[\"']?bearer\s+([^\s\"'\\,}]+)")
+_PLACEHOLDER_VALUE = re.compile(
+    r"(?i)^(?:\[?redacted\]?|<[^>]+>|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|"
+    r"x{4,}|\*{4,}|changeme|placeholder|example|demo|dummy|null|none|"
+    r"true|false|undefined|your[_-].*|test(?:[-_].*)?|mock(?:[-_].*)?|api[_-]?key)$"
+)
+
+
+def _plaintext_value(value: str) -> bool:
+    cleaned = value.strip().strip("\"'")
+    if not cleaned or _PLACEHOLDER_VALUE.fullmatch(cleaned):
+        return False
+    if any(char in cleaned for char in "()[]{}"):
+        return False
+    return not cleaned.lower().startswith(("os.", "process.", "config.", "settings."))
+
+
+def detect_plaintext_api_key_risk(path: Path) -> dict[str, Any]:
+    """Return whether a trace contains a plaintext API key, without returning the value."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    signals: set[str] = set()
+    for match in _API_KEY_ASSIGNMENT.finditer(text):
+        if _plaintext_value(match.group(1)):
+            signals.add("api_key_assignment")
+    for match in _AUTHORIZATION_BEARER.finditer(text):
+        if _plaintext_value(match.group(1)):
+            signals.add("authorization_bearer")
+    if _API_KEY_PREFIX.search(text):
+        signals.add("api_key_prefix")
+    return {
+        "risk": bool(signals),
+        "signals": sorted(signals),
+        "remark": PLAINTEXT_API_KEY_REMARK if signals else "",
+    }
+
+
 def main_trace_files(traces_dir: Path) -> list[Path]:
     """主会话 jsonl 位于 <traces>/<项目目录>/<sessionId>.jsonl；子代理在 <sessionId>/subagents/ 下，不算主会话。"""
     if not traces_dir.is_dir():

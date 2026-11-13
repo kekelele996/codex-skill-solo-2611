@@ -2,6 +2,28 @@
 
 本口径按 `sologsb-0917` 的 G16/G17 修订收窄，并针对数据工程补充幂等、迟到数据与 Schema 演进信号。
 
+## P4 强制合同
+
+难度论证必须是 `schemaVersion: 2`，并填写 `difficultyContract`：
+
+- `schema` 固定为 `platform-p4-v2`，`singleSurfaceChange` 必须为 `false`。
+- `taskNature` 说明这是状态型管道、恢复任务、对账任务或其他真实困难问题。
+- `boundaries` 至少 3 项，每项包含 `name`、`kind`、`source`、`promptAnchor`、`failureIfBroken`。
+- `kind` 只能是 `ingest`、`processing`、`persistence`、`publication`、`recovery`、`accounting`、
+  `authorization`、`downstream`。其中至少 2 个独立责任边界要来自除 `processing` 之外的七类，类型不能相同。
+- 每条 `source` 都必须真实存在，且这些边界至少要引用 2 个不同源码文件。
+- 每个 `promptAnchor` 必须是题面原句；`failureIfBroken` 必须写清业务后果。
+- `stateTransition` 必须写清开始状态、完成状态和可观察信号。
+- `crossBoundaryContract` 至少 30 字，并点名至少两个 `boundaries.name`。
+- `mediumAlternative` 必须写出平台可能判为中等的单点版本。
+- `nonRoutineDelta` 至少 30 字，并出现至少两类困难机制。
+- `independentRisks` 至少 2 项且 `kind` 不同。每项 `promptAnchor` 是题面原句，并由对应风险正则真实命中。
+- `substantiveComplexity.kinds` 必须是 `independentRisks` 支撑范围的子集。
+
+代码量、文件数、测试数、页面区域数不能把中等题升级为困难题。页面、结果表、弹窗和同一算法拆出的函数
+不算独立责任边界。输入重复后的去重是数据质量问题，不是幂等；幂等只认重跑、重新运行、重试、断点续跑
+之后不新增、不重复或保持一致。
+
 ## 平台三项特征
 
 1. 多模块整合：跨已有模块、数据所有权或上下游边界，并带出必须同时守住的不变量。
@@ -22,6 +44,8 @@
 
 每条困难/地狱题都必须填写：
 
+- `difficultyContract`：至少三个真实运行边界、两个独立责任边界、两个真实源码文件、状态迁移、
+  跨边界契约和两类原句风险。
 - `signals`：三项特征分别可否成立，附真实源码证据。
 - `platformSignals`：每项都有回答、题面原句和缺失后的可见后果。
 - `crossObjectInvariant`：至少两个对象名真实出现在题面里，并写清不变量和背离后果。
@@ -31,3 +55,11 @@
 - `mediumShapeDefense`：题目形似“在现有模块补一层”时必须解释真正复杂度。
 
 自由文字自证不算证据。题面引不到、源码文件不存在、对象名没出现，`prompt` 直接阻断。
+
+## 出题前换题门禁
+
+必须直接问：“如果页面完全不存在，剩下的是否仍是需要跨边界协调的困难问题？”答案为否时立即换题。
+
+无法填写至少三个运行边界、两个独立责任边界和两类原句风险时，必须在进入 `repo` 和 `run` 前阻断，
+通过换题解决。命中“判重只在……生效”“只按……归并”“工作台要显示……依据”等单点风险时，
+`nonRoutineDelta` 必须说明额外的跨边界约束，不能用增加页面描述、模块名或文件数量替代。

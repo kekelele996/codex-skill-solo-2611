@@ -72,6 +72,49 @@ DATA_TERMS = re.compile(
 )
 
 PLATFORM_SIGNAL_KEYS = ("multiModule", "designTradeoff", "complexConcern")
+BOUNDARY_KINDS = (
+    "ingest",
+    "processing",
+    "persistence",
+    "publication",
+    "recovery",
+    "accounting",
+    "authorization",
+    "downstream",
+)
+INDEPENDENT_BOUNDARY_KINDS = (
+    "ingest",
+    "persistence",
+    "publication",
+    "recovery",
+    "accounting",
+    "authorization",
+    "downstream",
+)
+NON_BOUNDARY_NAME_RE = re.compile(
+    r"(页面|界面|前端|表单|弹窗|弹框|结果表|报表|图表|卡片|按钮|视图|看板|函数|方法)"
+)
+NON_ROUTINE_MECHANISMS: dict[str, re.Pattern[str]] = {
+    "rerun": re.compile(r"(重跑|重试|重新运行|重复执行|断点续跑|重算)"),
+    "recovery": re.compile(r"(恢复|续跑)"),
+    "versioning": re.compile(r"(版本)"),
+    "cutover": re.compile(r"(切换)"),
+    "reconciliation": re.compile(r"(对账)"),
+    "isolation": re.compile(r"(隔离)"),
+    "concurrency": re.compile(r"(并发)"),
+    "rollback": re.compile(r"(回退|回滚)"),
+    "watermark": re.compile(r"(水位)"),
+    "invalidation": re.compile(r"(失效)"),
+    "publication": re.compile(r"(发布)"),
+    "ordering": re.compile(r"(乱序|顺序)"),
+    "atomic": re.compile(r"(原子)"),
+    "recompute": re.compile(r"(重算)"),
+    "compensation": re.compile(r"(补偿)"),
+}
+SINGLE_POINT_RISK_RE = re.compile(
+    r"(判重只在[^。；！？]{0,50}生效|只按[^。；！？]{0,40}归并|"
+    r"工作台要显示[^。；！？]{0,50}(?:依据|主件|来源))"
+)
 COMPLEXITY_PATTERNS: dict[str, re.Pattern[str]] = {
     "concurrency": re.compile(r"(并发|同时(?:写入|提交|同步|重跑)|多任务.{0,12}(?:覆盖|冲突)|竞态|租约|加锁)"),
     "failure-recovery": re.compile(r"(失败后.{0,16}(?:恢复|重试|续跑|断点)|中断.{0,16}(?:续跑|恢复)|崩溃.{0,16}(?:恢复|续跑))"),
@@ -81,9 +124,19 @@ COMPLEXITY_PATTERNS: dict[str, re.Pattern[str]] = {
     "offline-merge": re.compile(r"((?:离线|断网).{0,18}(?:合并|同步|恢复|冲突)|(?:网络恢复|重新连接).{0,18}(?:合并|同步|冲突))"),
     "state-invalidation": re.compile(r"((?:源数据|上游|字段|规则|水位).{0,16}(?:变化|更新).{0,16}(?:失效|重算|作废|重新跑)|(?:过期|失效).{0,16}(?:重算|重新跑|拒绝))"),
     "cross-system-reconciliation": re.compile(r"(对账|跨系统|源库.{0,16}(?:一致|不一致|冲突)|数仓.{0,16}(?:一致|不一致|冲突)|外部系统.{0,16}(?:返回|同步|不一致))"),
-    "idempotency": re.compile(r"(幂等|重复(?:执行|运行|投递).{0,16}(?:不新增|不重复|只生效一次|覆盖)|断点续跑.{0,16}(?:不重复|不新增))"),
+    "idempotency": re.compile(
+        r"(幂等|(?:(?:重跑|重新运行|重试|重复执行|断点续跑)[^。；！？]{0,24}"
+        r"(?:不新增|不重复|只生效一次|不覆盖|不改换|保持一致|"
+        r"(?:不能|不得|不会)(?:新增|重复|覆盖|改换))))"
+    ),
     "late-data": re.compile(r"((?:迟到|晚到|乱序).{0,16}(?:事件|记录|数据)|水位.{0,16}(?:迟到|晚到|乱序|回退))"),
     "schema-evolution": re.compile(r"((?:字段|Schema|表结构).{0,16}(?:新增|删除|变更|演进).{0,16}(?:兼容|迁移|隔离)|(?:兼容|迁移).{0,16}(?:字段|Schema|表结构))", re.I),
+    "atomic-cutover": re.compile(
+        r"(原子(?:切换|替换)|一次性切换|全量切换|切换[^。；！？]{0,18}(?:原子|回滚|失败)|"
+        r"(?:失败|中断)[^。；！？]{0,18}(?:保留|恢复)[^。；！？]{0,12}旧版)"
+    ),
+    "ordering": re.compile(r"(乱序|顺序保证|按[^。；！？]{0,16}顺序[^。；！？]{0,16}处理|先[^。；！？]{0,20}再[^。；！？]{0,20})"),
+    "data-loss": re.compile(r"(数据丢失|丢失数据|丢失记录|误删|永久删除|不再保留|覆盖后无法恢复)"),
 }
 
 # 平台点名的“在既有页面补一层”形态。命中后必须解释为什么它不只是多一步。
@@ -222,8 +275,8 @@ def _validate_difficulty(
     data, errors = _load_json(path)
     if errors:
         return {"ok": False, "errors": errors}
-    if data.get("schemaVersion") != 1:
-        errors.append("难度论证 schemaVersion 必须是 1")
+    if data.get("schemaVersion") != 2:
+        errors.append("难度论证 schemaVersion 必须是 2")
     if data.get("difficulty") != difficulty:
         errors.append(f"难度论证 difficulty 必须与命令行一致: {difficulty}")
     if data.get("routineOnly") is not False:
@@ -348,12 +401,219 @@ def _validate_difficulty(
     if MEDIUM_SHAPE_RE.search(prompt_text) and not _text_ok(data.get("mediumShapeDefense"), 20):
         errors.append("题面命中“在既有模块补一层”的中等形态，mediumShapeDefense 必须写清为什么不是只加一层")
 
+    contract = data.get("difficultyContract")
+    if not isinstance(contract, dict):
+        errors.append("difficultyContract 必须存在且为对象")
+        contract = {}
+    if contract.get("schema") != "platform-p4-v2":
+        errors.append("difficultyContract.schema 必须是 platform-p4-v2")
+    if contract.get("singleSurfaceChange") is not False:
+        errors.append("difficultyContract.singleSurfaceChange 必须明确为 false")
+    if not _text_ok(contract.get("taskNature"), 20):
+        errors.append("difficultyContract.taskNature 至少 20 字，说明任务的真实性质")
+
+    boundaries = contract.get("boundaries") if isinstance(contract.get("boundaries"), list) else []
+    boundary_summary: list[dict[str, str]] = []
+    boundary_names: list[str] = []
+    boundary_sources: list[str] = []
+    independent_boundaries: list[dict[str, str]] = []
+    if len(boundaries) < 3:
+        errors.append("difficultyContract.boundaries 至少需要 3 个运行边界")
+    for index, raw in enumerate(boundaries, start=1):
+        boundary = raw if isinstance(raw, dict) else {}
+        name = str(boundary.get("name") or "").strip()
+        kind = str(boundary.get("kind") or "").strip()
+        source = str(boundary.get("source") or "").strip()
+        anchor = str(boundary.get("promptAnchor") or "").strip()
+        failure = str(boundary.get("failureIfBroken") or "").strip()
+        missing = [
+            key for key, value in (
+                ("name", name),
+                ("kind", kind),
+                ("source", source),
+                ("promptAnchor", anchor),
+                ("failureIfBroken", failure),
+            )
+            if not value
+        ]
+        if missing:
+            errors.append(
+                f"difficultyContract.boundaries[{index}] 缺少字段: " + "、".join(missing)
+            )
+        if kind and kind not in BOUNDARY_KINDS:
+            errors.append(
+                f"difficultyContract.boundaries[{index}].kind 不在边界白名单: {kind}；"
+                f"允许 {', '.join(BOUNDARY_KINDS)}"
+            )
+        if name and NON_BOUNDARY_NAME_RE.search(name):
+            errors.append(
+                f"boundary“{name}”属于页面、结果表、弹窗或函数，不能算独立责任边界"
+            )
+        if name:
+            boundary_names.append(name)
+        if source:
+            boundary_sources.append(source)
+            candidate = (task_root / "workspace" / source).resolve()
+            workspace = (task_root / "workspace").resolve()
+            try:
+                candidate.relative_to(workspace)
+            except ValueError:
+                errors.append(f"boundary.source 必须位于 workspace 内: {source}")
+            else:
+                if not candidate.is_file():
+                    errors.append(f"boundary.source 引用了不存在的源码文件: {source}")
+        if anchor:
+            if non_space_len(anchor) < 8:
+                errors.append(f"boundary“{name or index}”的 promptAnchor 至少引用 8 字题面原句")
+            elif normalize(anchor) not in normalize(prompt_text):
+                errors.append(f"boundary“{name or index}”的 promptAnchor 不是题面原句")
+        if failure and not _text_ok(failure, 12):
+            errors.append(f"boundary“{name or index}”的 failureIfBroken 至少 12 字并说明业务后果")
+        item = {
+            "name": name,
+            "kind": kind,
+            "source": source,
+            "promptAnchor": anchor,
+            "failureIfBroken": failure,
+        }
+        boundary_summary.append(item)
+        if kind in INDEPENDENT_BOUNDARY_KINDS:
+            independent_boundaries.append(item)
+
+    if len(set(boundary_names)) != len(boundary_names):
+        errors.append("difficultyContract.boundaries.name 不能重复")
+    if len(independent_boundaries) < 2:
+        errors.append(
+            "difficultyContract 至少需要 2 个来自 ingest、persistence、publication、"
+            "recovery、accounting、authorization、downstream 的独立责任边界"
+        )
+    if len({item["kind"] for item in independent_boundaries}) < 2:
+        errors.append("至少 2 个独立责任边界必须来自不同 boundary kind")
+    if len(set(boundary_sources)) < 2:
+        errors.append("difficultyContract.boundaries 至少需要引用 2 个不同真实源码文件")
+
+    transition = contract.get("stateTransition")
+    transition_summary: dict[str, str] = {}
+    if not isinstance(transition, dict):
+        errors.append("difficultyContract.stateTransition 必须写清开始到完成的可观察状态迁移")
+    else:
+        for key, label, minimum in (
+            ("from", "开始状态", 6),
+            ("to", "完成状态", 6),
+            ("observableSignal", "可观察信号", 12),
+        ):
+            value = str(transition.get(key) or "").strip()
+            transition_summary[key] = value
+            if not _text_ok(value, minimum):
+                errors.append(
+                    f"difficultyContract.stateTransition.{key} 至少 {minimum} 字，写清{label}"
+                )
+
+    cross_contract = str(contract.get("crossBoundaryContract") or "").strip()
+    if not _text_ok(cross_contract, 30):
+        errors.append("difficultyContract.crossBoundaryContract 至少 30 字")
+    named_boundaries = [name for name in dict.fromkeys(boundary_names) if name in cross_contract]
+    if len(named_boundaries) < 2:
+        errors.append("difficultyContract.crossBoundaryContract 必须点名至少两个 boundaries.name")
+
+    medium_alternative = str(contract.get("mediumAlternative") or "").strip()
+    if not _text_ok(medium_alternative, 20):
+        errors.append("difficultyContract.mediumAlternative 必须写出平台可能判为中等的单点版本")
+
+    non_routine = str(contract.get("nonRoutineDelta") or "").strip()
+    non_routine_mechanisms = [
+        kind for kind, pattern in NON_ROUTINE_MECHANISMS.items() if pattern.search(non_routine)
+    ]
+    if not _text_ok(non_routine, 30):
+        errors.append("difficultyContract.nonRoutineDelta 至少 30 字")
+    if len(non_routine_mechanisms) < 2:
+        errors.append("difficultyContract.nonRoutineDelta 至少写出两类真实困难机制")
+    single_point_match = SINGLE_POINT_RISK_RE.search(prompt_text)
+    if single_point_match:
+        if not _text_ok(non_routine, 30):
+            errors.append("题面命中单点风险，nonRoutineDelta 必须说明额外的跨边界约束")
+        if len([name for name in dict.fromkeys(boundary_names) if name in non_routine]) < 2:
+            errors.append("题面命中单点风险，nonRoutineDelta 必须点名至少两个运行边界")
+        if not re.search(r"(跨边界|边界协调|跨责任|贯穿)", non_routine):
+            errors.append("题面命中单点风险，nonRoutineDelta 必须明确写出跨边界约束")
+
+    risks = contract.get("independentRisks") if isinstance(contract.get("independentRisks"), list) else []
+    risk_summary: list[dict[str, str]] = []
+    risk_kinds: list[str] = []
+    if len(risks) < 2:
+        errors.append("difficultyContract.independentRisks 至少需要 2 项")
+    for index, raw in enumerate(risks, start=1):
+        risk = raw if isinstance(raw, dict) else {}
+        kind = str(risk.get("kind") or "").strip()
+        anchor = str(risk.get("promptAnchor") or "").strip()
+        consequence = str(risk.get("businessConsequence") or "").strip()
+        missing = [
+            key for key, value in (
+                ("kind", kind),
+                ("promptAnchor", anchor),
+                ("businessConsequence", consequence),
+            )
+            if not value
+        ]
+        if missing:
+            errors.append(
+                f"difficultyContract.independentRisks[{index}] 缺少字段: " + "、".join(missing)
+            )
+        if kind:
+            risk_kinds.append(kind)
+            if kind not in COMPLEXITY_PATTERNS:
+                errors.append(f"difficultyContract.independentRisks[{index}].kind 未知: {kind}")
+        if anchor:
+            if non_space_len(anchor) < 8:
+                errors.append(
+                    f"difficultyContract.independentRisks[{index}].promptAnchor 至少引用 8 字题面原句"
+                )
+            elif normalize(anchor) not in normalize(prompt_text):
+                errors.append(
+                    f"difficultyContract.independentRisks[{index}].promptAnchor 不是题面原句"
+                )
+            elif kind in COMPLEXITY_PATTERNS and not COMPLEXITY_PATTERNS[kind].search(anchor):
+                errors.append(
+                    f"difficultyContract.independentRisks[{index}].promptAnchor 未被 {kind} 风险正则命中"
+                )
+        if consequence and not _text_ok(consequence, 12):
+            errors.append(
+                f"difficultyContract.independentRisks[{index}].businessConsequence 至少 12 字"
+            )
+        risk_summary.append({
+            "kind": kind,
+            "promptAnchor": anchor,
+            "businessConsequence": consequence,
+        })
+    if len(set(risk_kinds)) < 2:
+        errors.append("difficultyContract.independentRisks 至少需要两类不同 kind")
+    if set(kinds) - set(risk_kinds):
+        errors.append(
+            "substantiveComplexity.kinds 必须是 difficultyContract.independentRisks 支撑范围的子集"
+        )
+
+    p4_contract = {
+        "schema": str(contract.get("schema") or ""),
+        "taskNature": str(contract.get("taskNature") or ""),
+        "singleSurfaceChange": contract.get("singleSurfaceChange"),
+        "boundaries": boundary_summary,
+        "independentBoundaryKinds": sorted({
+            item["kind"] for item in independent_boundaries if item.get("kind")
+        }),
+        "sourceFiles": list(dict.fromkeys(boundary_sources)),
+        "stateTransition": transition_summary,
+        "nonRoutineMechanisms": non_routine_mechanisms,
+        "singlePointRiskMatched": bool(single_point_match),
+        "independentRisks": risk_summary,
+    }
+
     return {
         "ok": not errors,
         "errors": errors,
         "signalsPassed": passed_count,
         "substantiveKinds": supported,
         "mediumShapeMatched": bool(MEDIUM_SHAPE_RE.search(prompt_text)),
+        "p4Contract": p4_contract,
     }
 
 
@@ -473,6 +733,7 @@ def validate_candidate(
         "errors": errors,
         "warnings": warnings,
         "difficultyReview": difficulty_result,
+        "p4Contract": difficulty_result.get("p4Contract") or {},
         "raRenhuaReview": str(review_path),
     }
 

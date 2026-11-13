@@ -472,4 +472,5 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
             "index": verdict["index"],
             "checkedAt": verdict["checkedAt"],
         }
+        result["traceAlignment"] = verdict.get("traceAlignment") or {}
     return result

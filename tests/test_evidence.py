@@ -274,6 +274,39 @@ def test_failure_evidence_may_come_from_trace(tmp_path):
     assert not any("没有任何失败输出" in item for item in errors)
 
 
+def test_feedback_cannot_claim_business_runtime_when_trace_is_static_only(tmp_path):
+    """V2 回归：轨迹明确未跑后端时，反馈不能写业务链路“验证了/跑通”。"""
+    events = _events(
+        result="No module named pip",
+        final="前端 vite build 通过。没有 pip 和 Docker，后端无法跑运行时验证。",
+    )
+    root, state, ws = _task(tmp_path, events=events)
+    _record(root, ws, "print('static check complete')\n")
+
+    overclaim = evidence.check(
+        root,
+        state,
+        "验证了规则删除和同名重报后旧报告保持不变。",
+        3,
+    )
+    alignment = overclaim["traceAlignment"]
+    assert alignment["status"] == "failed"
+    assert alignment["traceCapabilityLevel"] == "runtime-blocked-static-only"
+    assert alignment["unsupportedRuntimeClaims"]
+    assert any("超出轨迹能证明的验证层级" in item for item in overclaim["errors"])
+
+    bounded = evidence.check(
+        root,
+        state,
+        "代码已经保留历史规则，报告优先读取批次数据；"
+        "数据库迁移和同名重报没有运行验证，仍是待补缺口。",
+        3,
+    )
+    assert bounded["traceAlignment"]["status"] == "passed"
+    assert bounded["traceAlignment"]["unsupportedRuntimeClaims"] == []
+    assert not any("超出轨迹能证明的验证层级" in item for item in bounded["errors"])
+
+
 # ======================================================================= 索引与摘要
 
 def test_index_summary_shape(tmp_path):

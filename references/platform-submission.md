@@ -31,14 +31,20 @@
 
 轨迹上传结果写入 `trace_file` 数组；视频上传结果的 URL 写入 `screencast`。
 
+上传前会读取当前主会话轨迹并做明文 API Key 扫描。命中 `API_KEY`、`apikey`、
+`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_API_KEY`、常见服务商 Key 前缀或 Bearer 明文凭据时，
+提交备注固定写为 `轨迹中有存在明文apikey暴露风险`。扫描不记录或输出凭据原值。
+
 ## 表单
 
 表单由服务端动态返回，不能写死字段。`solo-2611` 从交付表第二行读取官方 19 列表头，
 按 schema 的 `label` 映射到 `field_key`；同时校验必填项、选项、URL、数字范围和父子字段联动。
 当前表单 fingerprint 每次提交前现场读取。
 
-`other_issues`（备注）无论服务端是否返回、是否标记必填，都先从动态 schema 和最终 payload 中剔除。
-交付表对应列固定为空，上传、新建和返修都不得携带该字段。
+`other_issues`（备注）默认从动态 schema 和最终 payload 中剔除，交付表对应列默认为空。
+唯一例外是最终主会话轨迹命中了明文 API Key 风险：此时交付表和 payload 都固定写入
+`轨迹中有存在明文apikey暴露风险`。预检和返修必须基于当前轨迹重新检测，不能信任陈旧预览值；
+检测未命中时，即使服务端原记录已有备注，也不得沿用。
 
 ## 账号领域锁定（L1）
 
@@ -114,7 +120,8 @@ python3 scripts/solo2611.py repair --task-root ROOT \
 ```
 
 视频本身需要更新时加 `--refresh-video`。返修只能调用原提交 ID 的 `PUT`，不能创建新记录，
-也不能改写锁定字段。服务端原记录即使带有 `other_issues`，返修 payload 也必须省略该字段。
+也不能改写锁定字段。`other_issues` 仅在当前轨迹重新命中明文 API Key 风险时写入固定备注，
+否则必须从返修 payload 中省略。
 
 ## 本地结果
 

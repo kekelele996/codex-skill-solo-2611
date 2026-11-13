@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "difficulty": "困难",
   "signals": {
     "multiModule": {
@@ -69,6 +69,54 @@
     "promptQuote": "必须逐字引用题面中体现实质复杂度的原句，至少12字",
     "whyHard": "说明为什么这句需求需要设计、恢复或深水调试，至少20字",
     "visibleFailure": "实现错误时会出现什么可见后果，至少12字"
+  },
+  "difficultyContract": {
+    "schema": "platform-p4-v2",
+    "taskNature": "说明这是状态型管道、恢复任务、对账任务或其他需要跨边界协调的真实困难问题，至少20字",
+    "singleSurfaceChange": false,
+    "boundaries": [
+      {
+        "name": "真实运行责任边界A",
+        "kind": "ingest",
+        "source": "src/真实文件A.ts",
+        "promptAnchor": "必须逐字引用题面里对应这条边界的原句",
+        "failureIfBroken": "写清这条边界失效时会造成什么业务后果，至少12字"
+      },
+      {
+        "name": "真实运行责任边界B",
+        "kind": "persistence",
+        "source": "src/真实文件B.ts",
+        "promptAnchor": "必须逐字引用题面里对应这条边界的另一句原句",
+        "failureIfBroken": "写清这条边界失效时会造成什么业务后果，至少12字"
+      },
+      {
+        "name": "真实运行责任边界C",
+        "kind": "publication",
+        "source": "src/真实文件A.ts",
+        "promptAnchor": "必须逐字引用题面里对应这条边界的第三句原句",
+        "failureIfBroken": "写清这条边界失效时会造成什么业务后果，至少12字"
+      }
+    ],
+    "stateTransition": {
+      "from": "写清任务开始时的可观察状态",
+      "to": "写清任务完成后的可观察状态",
+      "observableSignal": "写清用什么业务结果能观察开始到完成的状态迁移"
+    },
+    "crossBoundaryContract": "至少30字，点名上面两个 boundaries.name，说明它们必须共同守住什么跨边界契约",
+    "mediumAlternative": "写出如果只做页面展示、结果表、单条判重或单文件处理时，平台可能判为中等的单点版本",
+    "nonRoutineDelta": "至少30字，写出两类困难机制并说明相对单点版本新增了哪些跨边界协调；命中单点风险时必须点名两个 boundaries.name",
+    "independentRisks": [
+      {
+        "kind": "atomic-cutover",
+        "promptAnchor": "必须逐字引用题面中能被 atomic-cutover 风险正则命中的原句",
+        "businessConsequence": "写清这类风险发生时会造成什么业务后果，至少12字"
+      },
+      {
+        "kind": "data-loss",
+        "promptAnchor": "必须逐字引用题面中能被 data-loss 风险正则命中的另一句原句",
+        "businessConsequence": "写清这类风险发生时会造成什么业务后果，至少12字"
+      }
+    ]
   },
   "mediumShapeDefense": "题面命中“在既有模块补一层”的常见中等形态时必填，写清为什么不是只加一层，至少20字",
   "hellSignal": {

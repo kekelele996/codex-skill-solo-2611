@@ -378,8 +378,15 @@ def cmd_prompt(args: argparse.Namespace) -> None:
     with PROMPT_HISTORY.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps({"taskRoot": str(task_root), "sha256": sha, "date": local_date(), "text": text},
                             ensure_ascii=False) + "\n")
-    emit({"ok": True, "promptPath": str(prompt_path), "sha256": sha, "warnings": warnings,
-          "difficultySignalsPassed": state["difficultySignalsPassed"], "next": "repo"})
+    emit({
+        "ok": True,
+        "promptPath": str(prompt_path),
+        "sha256": sha,
+        "warnings": warnings,
+        "difficultySignalsPassed": state["difficultySignalsPassed"],
+        "p4Contract": design.get("p4Contract") or {},
+        "next": "repo",
+    })
 
 
 # ======================================================================= run
@@ -916,10 +923,18 @@ def cmd_feedback(args: argparse.Namespace) -> None:
         return
     result = fb.check(path, task_root=task_root, state=state)
     write_json(task_root / "monitor" / "feedback-check.json", {k: v for k, v in result.items() if k != "feedback"})
+    trace_alignment = result.get("traceAlignment") or {}
+    write_json(task_root / "monitor" / "feedback-trace-audit.json", trace_alignment)
     verification = {
         "sha256": sha256_file(evidence.verification_path(task_root)) if evidence.verification_path(task_root).is_file() else "",
         "runs": len(evidence.runs(task_root)),
         "feedbackSha256": sha256_file(path),
+        "traceAlignment": {
+            "status": trace_alignment.get("status"),
+            "feedbackRuntimeCeiling": trace_alignment.get("feedbackRuntimeCeiling"),
+            "traceCapabilityLevel": trace_alignment.get("traceCapabilityLevel"),
+            "unsupportedRuntimeClaims": trace_alignment.get("unsupportedRuntimeClaims") or [],
+        },
         "checkedAt": utc_now(),
     }
     write_json(task_root / "monitor" / "feedback-evidence.json", verification)
@@ -928,6 +943,12 @@ def cmd_feedback(args: argparse.Namespace) -> None:
         "ok": result["ok"], "score": result["score"], "warnings": result["warnings"],
         "sha256": sha256_file(path), "checkedAt": utc_now(),
         "evidence": ev.get("summary") or {},
+        "traceAlignment": {
+            "status": trace_alignment.get("status"),
+            "feedbackRuntimeCeiling": trace_alignment.get("feedbackRuntimeCeiling"),
+            "traceCapabilityLevel": trace_alignment.get("traceCapabilityLevel"),
+            "unsupportedRuntimeClaims": trace_alignment.get("unsupportedRuntimeClaims") or [],
+        },
         "fullScoreReview": result.get("fullScoreReview") or {},
         "verificationSha256": verification["sha256"],
     }
@@ -935,6 +956,7 @@ def cmd_feedback(args: argparse.Namespace) -> None:
     emit({
         "ok": result["ok"], "score": result["score"], "errors": result["errors"], "warnings": result["warnings"],
         "evidence": ev.get("summary") or {},
+        "traceAlignment": trace_alignment,
         "fullScoreReview": result.get("fullScoreReview") or {},
     })
     if not result["ok"]:
@@ -1027,6 +1049,11 @@ def build_row(task_root: Path) -> tuple[dict[str, Any], dict[str, Any], list[str
             missing.append("Feedback 检查未通过：" + "；".join(checked["errors"]))
     else:
         missing.append("delivery/feedback.md（证据化起草并完成专家复核）")
+    trace_api_key_risk = (
+        tr.detect_plaintext_api_key_risk(Path(session["trace"]))
+        if session.get("trace") and Path(session["trace"]).is_file()
+        else {"risk": False, "signals": [], "remark": ""}
+    )
     prompt = Path(state["promptPath"]).read_text(encoding="utf-8") if state.get("promptPath") else ""
     if state.get("promptPath"):
         prompt_path = Path(state["promptPath"])
@@ -1057,7 +1084,7 @@ def build_row(task_root: Path) -> tuple[dict[str, Any], dict[str, Any], list[str
         "运行录屏": rec.get("video", ""),
         "交付完整性": fbr["score"],
         "Feedback": fbr["feedback"],
-        "备注": "",
+        "备注": trace_api_key_risk["remark"],
     }
     optional = {"环境可复现等级", "备注"}
     if missing:  # feedback 已经报过缺失，不再重复列这两列
@@ -1075,6 +1102,7 @@ def build_row(task_root: Path) -> tuple[dict[str, Any], dict[str, Any], list[str
         "录屏时长(秒)": rec.get("durationSeconds", ""), "录屏大小(MB)": rec.get("sizeMB", ""),
         "录屏采集方式": rec.get("captureKind", ""), "录屏窗口证据": rec.get("windowCaptureOk", ""),
         "Feedback 检查警告": "；".join(fbr.get("warnings") or []), "导出时间": utc_now(),
+        "轨迹明文API Key风险": trace_api_key_risk["risk"],
     }
     return row, internal, missing
 

@@ -1,6 +1,6 @@
 {
-  "version": "0.4.8",
-  "release_tag": "v0.4.8",
+  "version": "0.5.0",
+  "release_tag": "v0.5.0",
   "period": "26.11 领域专项（安全 / 游戏图形多媒体 / 数据工程最新分类）",
   "image": "adminfather/benzhi-claude-code2:20261110",
   "harnessVersion": "2.1.303"

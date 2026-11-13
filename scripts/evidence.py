@@ -55,6 +55,33 @@ FAILURE_CLAIM = re.compile(
     r"失败后|导致[^。；]{0,12}失败|停在原处|推进不了|无法推进)"
 )
 
+# 平台 V2 会按“反馈是否超出轨迹能证明的验证层级”复核。这里只拦最危险的一类：
+# 轨迹自己已经承认后端/数据库/完整服务无法运行，反馈却把相关业务链路写成“验证了/跑通了”。
+TRACE_RUNTIME_LIMIT = re.compile(
+    r"(No module named pip|没有\s*pip|无\s*pip|"
+    r"docker(?:\s+compose)?[^。\n]{0,24}(?:不可用|无法使用|未安装|command not found|not found)|"
+    r"没有\s*(?:pip\s*[/和、]\s*)?docker|无法(?:启动|运行|连接)[^。\n]{0,24}"
+    r"(?:MySQL|数据库|服务|业务链路|完整流程)|"
+    r"(?:数据库|MySQL|服务|后端)[^。\n]{0,24}(?:无法|不能|未)[^。\n]{0,12}(?:运行|启动|验证)|"
+    r"(?:只|仅)(?:能|做|完成)[^。\n]{0,16}(?:语法|静态)(?:级)?(?:检查|验证))",
+    re.I,
+)
+STATIC_VERIFICATION = re.compile(
+    r"(compileall|SYNTAX OK|BACKEND SYNTAX OK|语法检查|vite build|npm run build|"
+    r"frontend build|前端构建|构建通过|type[- ]check)",
+    re.I,
+)
+BUSINESS_RUNTIME_CLAIM = re.compile(
+    r"(验证了[^。；\n]{0,80}(?:规则|重报|重跑|删除|报告|页面|接口|数据库|迁移|台账|批次|业务链路)|"
+    r"(?:实际|真实)(?:跑通|执行|回读|导出|重报)[^。；\n]{0,50}|"
+    r"(?:跑通|端到端验证|业务链路验证|真实回读)[^。；\n]{0,50}|"
+    r"(?:数据库迁移|同名重报|报告导出|页面操作)[^。；\n]{0,24}(?:成功|通过|正常|可用))"
+)
+RUNTIME_DENIAL = re.compile(
+    r"(没有运行验证|未运行验证|没有实际运行|未实际运行|只完成.{0,12}(?:语法|静态)|"
+    r"仅完成.{0,12}(?:语法|静态)|无法运行|不能运行|不可用|仍需补|尚未覆盖)"
+)
+
 INLINE_EXEC = {
     "python", "python3", "python3.11", "python3.12", "python3.13", "python3.14",
     "node", "deno", "bun", "bash", "sh", "zsh", "pwsh", "perl", "ruby", "php",
@@ -121,7 +148,6 @@ def record_run(
         stdout = (exc.stdout or b"").decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
         stderr = (exc.stderr or b"").decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
     duration = round(time.time() - started, 2)
-
     existing = runs(task_root)
     index = len(existing) + 1
     log_dir = task_root / LOG_REL
@@ -175,7 +201,15 @@ def _file_sha(path: Path) -> str:
 
 def _trace_facts(task_root: Path) -> dict[str, Any]:
     """主会话轨迹里真实出现过的文件路径、输出文本、步骤数，以及是否出现过失败。"""
-    facts: dict[str, Any] = {"outputs": [], "commands": [], "paths": set(), "failed": False, "steps": 0, "hashes": []}
+    facts: dict[str, Any] = {
+        "outputs": [],
+        "commands": [],
+        "assistant_texts": [],
+        "paths": set(),
+        "failed": False,
+        "steps": 0,
+        "hashes": [],
+    }
     traces_dir = task_root / "traces"
     if not traces_dir.is_dir():
         return facts
@@ -206,6 +240,10 @@ def _trace_facts(task_root: Path) -> dict[str, Any]:
                     facts["outputs"].append(text)
                 if block.get("is_error"):
                     facts["failed"] = True
+            elif kind in {"text", "thinking"}:
+                text = str(block.get("text") or block.get("thinking") or "").strip()
+                if text:
+                    facts["assistant_texts"].append(text)
     for path in tr.subagent_files(mains[0]) if mains else []:
         facts["hashes"].append({"path": str(path), "sha256": _file_sha(path)})
         try:
@@ -219,6 +257,10 @@ def _trace_facts(task_root: Path) -> dict[str, Any]:
                     facts["outputs"].append(text)
                 if block.get("is_error"):
                     facts["failed"] = True
+            elif block.get("type") in {"text", "thinking"}:
+                text = str(block.get("text") or block.get("thinking") or "").strip()
+                if text:
+                    facts["assistant_texts"].append(text)
     return facts
 
 
@@ -279,6 +321,56 @@ def _derived_numbers(per_run: list[set[str]]) -> set[str]:
     return derived
 
 
+def _claim_sentences(feedback: str) -> list[str]:
+    return [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[。！？；\n])", feedback)
+        if sentence.strip()
+    ]
+
+
+def _evidence_snippet(text: str, pattern: re.Pattern[str]) -> str:
+    match = pattern.search(text)
+    if not match:
+        return ""
+    start = max(0, match.start() - 50)
+    end = min(len(text), match.end() + 100)
+    return re.sub(r"\s+", " ", text[start:end]).strip()
+
+
+def audit_trace_alignment(feedback: str, trace_facts: dict[str, Any]) -> dict[str, Any]:
+    """审计 Feedback 是否越过轨迹能证明的验证层级。
+
+    轨迹中的 assistant 文本不能证明功能成功，但可以证明其自我承认的能力上限。
+    如果轨迹明确说后端/数据库/完整服务未运行，而 Feedback 又写成业务链路“验证了/跑通”，
+    这正是平台 V2 会打回的事实矛盾。
+    """
+    tool_text = "\n".join(str(item) for item in (trace_facts.get("outputs") or []))
+    assistant_text = "\n".join(str(item) for item in (trace_facts.get("assistant_texts") or []))
+    trace_text = "\n".join([tool_text, assistant_text])
+    limited = bool(TRACE_RUNTIME_LIMIT.search(trace_text))
+    static_only = limited and bool(STATIC_VERIFICATION.search(trace_text))
+    unsupported: list[str] = []
+    if limited:
+        for sentence in _claim_sentences(feedback):
+            if BUSINESS_RUNTIME_CLAIM.search(sentence) and not RUNTIME_DENIAL.search(sentence):
+                unsupported.append(sentence)
+    level = "runtime-blocked-static-only" if static_only else (
+        "runtime-blocked" if limited else "unknown"
+    )
+    return {
+        "status": "failed" if unsupported else "passed",
+        "feedbackRuntimeCeiling": "code-and-static-only" if limited else "no-explicit-limitation",
+        "traceCapabilityLevel": level,
+        "runtimeLimited": limited,
+        "staticVerificationDetected": bool(STATIC_VERIFICATION.search(trace_text)),
+        "unsupportedRuntimeClaims": unsupported,
+        "limitationEvidence": _evidence_snippet(trace_text, TRACE_RUNTIME_LIMIT) if limited else "",
+        "staticEvidence": _evidence_snippet(trace_text, STATIC_VERIFICATION)
+        if STATIC_VERIFICATION.search(trace_text) else "",
+    }
+
+
 def build_index(task_root: Path, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     """返回（可持久化的索引摘要, 核对时使用的完整语料）。全部由脚本自己构建。"""
     workspace = Path(state.get("workspace") or "")
@@ -331,6 +423,7 @@ def build_index(task_root: Path, state: dict[str, Any]) -> tuple[dict[str, Any],
         "trace": trace_text,
         "code": code_text,
         "numbers": known_numbers,
+        "_traceFacts": trace_facts,
     }
     return index, corpus
 
@@ -361,6 +454,14 @@ def check(task_root: Path, state: dict[str, Any], feedback: str, score: int) -> 
     errors: list[str] = []
     warnings: list[str] = []
     claims: list[dict[str, Any]] = []
+    trace_alignment = audit_trace_alignment(feedback, corpus.get("_traceFacts") or {})
+    index["traceAlignment"] = trace_alignment
+    if trace_alignment["unsupportedRuntimeClaims"]:
+        errors.append(
+            "Feedback 超出轨迹能证明的验证层级：轨迹已明确说明业务运行受限，"
+            f"但正文仍写成运行验证成功。需改成“代码已实现/静态检查通过”，并把未运行项写成缺口。"
+            f"越级表述：{trace_alignment['unsupportedRuntimeClaims']}"
+        )
 
     known_paths = set(index["paths"])
     known_numbers: set[str] = set(corpus["numbers"])
@@ -450,5 +551,6 @@ def check(task_root: Path, state: dict[str, Any], feedback: str, score: int) -> 
         "claims": claims,
         "summary": {"claims": len(claims), "verified": verified, "unverified": len(claims) - verified},
         "index": index,
+        "traceAlignment": trace_alignment,
         "checkedAt": utc_now(),
     }
