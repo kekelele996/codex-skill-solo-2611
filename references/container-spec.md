@@ -47,7 +47,7 @@ tmux 命令行、`ps` 输出和 `launch.sh` 都不包含 Key。题面发出后�
 - 主会话：`traces/-workspace/<sessionId>.jsonl`；子代理轨迹在 `traces/-workspace/<sessionId>/subagents/`。
 - 真人消息：`type=user`、带 `promptId`、`version=2.1.303`。
 - 结束判断：最后一条主线 assistant 的 `message.stop_reason=end_turn` 且不是 `isApiErrorMessage`。
-  自动继续只接受明确 API/接口故障；正常结束里的提问、提交/推送/PR询问或“下一步可以”都不是接口故障。
+  自动或人工继续只接受明确 API/接口故障；正常结束里的提问、提交/推送/PR询问或“下一步可以”都不是接口故障。
 - 正常结束直接进入终态，不自动恢复、不录屏、不导出、不提交。
 - 误触发继续：监督器必须停止；可用 `recover-round` 在保留原始轨迹副本和哈希的前提下，截到正常完成轮次，
   不得向同一会话再补发“继续”。
