@@ -146,6 +146,14 @@ def test_round_ended_requires_trace_and_screen_idle() -> None:
         screen="esc to interrupt",
         now=100,
     )
+    assert session.round_ended(
+        events,
+        file_size=10,
+        previous_size=10,
+        last_growth_at=80,
+        screen="nothing to commit, working tree clean",
+        now=100,
+    )
 
 
 def test_trace_allows_two_continues_and_rejects_three(tmp_path: Path) -> None:
@@ -222,6 +230,17 @@ def test_managed_names_are_docker_and_tmux_safe() -> None:
     assert re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", name)
     assert name.startswith("solo2611-task-")
     assert re.fullmatch(r"[a-z0-9][a-z0-9_-]*", tmux_name)
+
+
+def test_continue_marks_only_latest_round() -> None:
+    session_state = {
+        "rounds": [
+            {"no": 1, "continued": False},
+            {"no": 2, "continued": False},
+        ]
+    }
+    session._mark_latest_round_continued(session_state)
+    assert [item["continued"] for item in session_state["rounds"]] == [False, True]
 
 
 def test_interactive_prerequisites_accept_current_tmux() -> None:

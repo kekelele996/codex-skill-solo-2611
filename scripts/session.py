@@ -46,7 +46,7 @@ TERMINAL = {"accepted", "aborted"}
 ACTIVE = {"launching", "prompt_sent", "running", "continuing", "holding", "manual_input", "closing"}
 RUNNING_ATTEMPT_STATUSES = {"running", "start_failed", "pending_collect"}
 REPL_READY = re.compile(r"(?m)(?:^|\n)\s*(?:>|❯|›)\s*$")
-SCREEN_BUSY = re.compile(r"(?i)esc\s+to\s+interrupt|ctrl\+c\s+to\s+interrupt|thinking|working")
+SCREEN_BUSY = re.compile(r"(?i)esc\s+to\s+interrupt|ctrl\+c\s+to\s+interrupt")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
 
@@ -836,6 +836,13 @@ def _round_number(events: list[dict[str, Any]]) -> int:
     return max(1, len(_main_user_events(events)))
 
 
+def _mark_latest_round_continued(session: dict[str, Any]) -> None:
+    for round_item in reversed(session.get("rounds") or []):
+        if isinstance(round_item, dict):
+            round_item["continued"] = True
+            return
+
+
 def _record_round(
     state: dict[str, Any],
     events: list[dict[str, Any]],
@@ -996,6 +1003,7 @@ def _handle_human_commands(
             append_event(task_root, attempt, "continue.deferred", reason="screen_busy", sentBy="human")
             continue
         send_continue(str(session.get("tmuxSession") or ""))
+        _mark_latest_round_continued(session)
         used += 1
         continues["used"] = used
         history = continues.setdefault("history", [])
@@ -1257,7 +1265,7 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                                         "waitedMs": int(wait * 1000),
                                     }
                                 )
-                                item["continued"] = True
+                                _mark_latest_round_continued(session)
                                 session["status"] = "running"
                                 session["pendingContinue"] = None
                                 session["nextActionAt"] = None
