@@ -923,6 +923,19 @@ def cmd_collect(args: argparse.Namespace) -> None:
     raise SystemExit(2)
 
 
+def cmd_recover_round(args: argparse.Namespace) -> None:
+    """Audit a clean end_turn boundary and discard later false-continue data."""
+    task_root = Path(args.task_root).resolve()
+    emit(
+        managed.recover_round_boundary(
+            task_root,
+            round_no=int(args.round),
+            reason=args.reason,
+            execute=bool(args.execute),
+        )
+    )
+
+
 def cmd_supervise(args: argparse.Namespace) -> None:
     task_root = Path(args.task_root).resolve()
     managed.supervisor_loop(task_root, int(args.attempt), attach=bool(args.attach))
@@ -1743,6 +1756,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--task-root", required=True)
     s.add_argument("--container")
     s.set_defaults(fn=cmd_collect)
+
+    s = sub.add_parser(
+        "recover-round",
+        help="误触发继续后，按正常完成轮次回切正式轨迹（保留原始审计副本）",
+    )
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--round", type=int, default=1, help="作为正式边界的正常完成轮次")
+    s.add_argument("--reason", required=True, help="误触发继续的客观原因")
+    s.add_argument("--execute", action="store_true", help="确认预览后写入边界并接受会话")
+    s.set_defaults(fn=cmd_recover_round)
 
     s = sub.add_parser("reset", help="把 workspace 恢复到初始快照")
     s.add_argument("--task-root", required=True)

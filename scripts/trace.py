@@ -35,6 +35,9 @@ _PLACEHOLDER_VALUE = re.compile(
     r"x{4,}|\*{4,}|changeme|placeholder|example|demo|dummy|null|none|"
     r"true|false|undefined|your[_-].*|test(?:[-_].*)?|mock(?:[-_].*)?|api[_-]?key)$"
 )
+SYNTHETIC_USER_TEXT = re.compile(
+    r"(?:\[?Request interrupted by user\]?|Request was aborted)"
+)
 
 
 def _plaintext_value(value: str) -> bool:
@@ -132,9 +135,16 @@ def is_real_user_prompt(event: dict[str, Any]) -> bool:
     content = _content(event)
     if isinstance(content, str):
         text = content.strip()
-        return bool(text) and not text.startswith(("<system-reminder>", "<task-notification>"))
+        return (
+            bool(text)
+            and not text.startswith(("<system-reminder>", "<task-notification>"))
+            and not SYNTHETIC_USER_TEXT.fullmatch(text)
+        )
     if isinstance(content, list):
         if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return False
+        text = _text_of(content).strip()
+        if text and SYNTHETIC_USER_TEXT.fullmatch(text):
             return False
         return any(isinstance(b, dict) and b.get("type") in {"text", "image"} for b in content)
     return False
@@ -279,9 +289,12 @@ PLAN_PROMISE = re.compile(
     r"下面(我)?(开始|将)|正准备|马上(开始|执行)|我先(说明|列出|梳理)[^。]{0,40}(然后|再))"
 )
 CUT_OFF = re.compile(
-    r"(由于[^。]{0,20}(限制|超时|中断|无法访问)|上下文(不足|已满|限制)|context (window|limit)|"
-    r"(token|tokens)[^。]{0,12}(不足|用完|限制)|(请求|操作)(被)?(中断|取消|超时)|"
-    r"interrupted|aborted|timed out|Request was aborted|API Error|无法继续执行)"
+    r"(由于[^。]{0,20}(限制|超时|无法访问)[^。]{0,40}(没有|未能|停止|无法|剩下|未完成)|"
+    r"上下文(不足|已满|限制)|context (window|limit)[^\n]{0,32}(exceeded|full|limit)|"
+    r"(token|tokens)[^。]{0,12}(不足|用完|限制)|"
+    r"(?m:^\s*\[?Request interrupted by user\]?\s*$)|"
+    r"(?m:^\s*Request was aborted\s*$)|"
+    r"(?m:^\s*API Error(?::|\b))|无法继续执行)"
 )
 INCOMPLETE_TAIL = re.compile(r"([,，、:：；;]|以及|和|或者|例如|\b(and|or|then|with|the|to)\b)\s*$")
 

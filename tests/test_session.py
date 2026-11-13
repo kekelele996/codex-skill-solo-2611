@@ -101,6 +101,8 @@ def _task_root(tmp_path: Path) -> Path:
         ("quota exceeded", True, "stop_sequence", "quota", "hold"),
         ("normal answer", False, "max_tokens", "truncated", "continue"),
         ("上下文已满", False, "end_turn", "truncated", "continue"),
+        ("批次状态为 interrupted，但字段、页面和验证均已完成。", False, "end_turn", "none", "complete"),
+        ("Request interrupted by user", False, "end_turn", "truncated", "continue"),
         ("", False, "end_turn", "empty", "continue"),
         ("需要我继续吗？", False, "end_turn", "incomplete", "continue"),
         ("已完成", False, "end_turn", "none", "complete"),
@@ -178,6 +180,20 @@ def test_trace_allows_two_continues_and_rejects_three(tmp_path: Path) -> None:
     assert not tr.analyze(path, "原始题面")["ok"]
 
 
+def test_complete_round_prefix_keeps_only_clean_first_round() -> None:
+    events = [
+        _event("user", "原始题面", prompt_id="p1"),
+        _event("assistant", "实例状态为 interrupted，但全部字段、页面和验证已完成。"),
+        _event("user", "继续", prompt_id="p2"),
+        _event("assistant", "误追加内容"),
+    ]
+    prefix, cut_at, discarded = session.complete_round_prefix(events, 1)
+    assert len(prefix) == 2
+    assert cut_at == 2
+    assert discarded == ["p2"]
+    assert tr.analyze_from_events(prefix, "原始题面")["ok"]
+
+
 def test_trace_rejects_human_intervention(tmp_path: Path) -> None:
     events = [
         _event("user", "原始题面", prompt_id="p1"),
@@ -203,6 +219,21 @@ def test_trace_ignores_background_task_notifications(tmp_path: Path) -> None:
     events = [
         _event("user", "原始题面", prompt_id="p1"),
         notification,
+        _event("assistant", "已完成"),
+    ]
+    path = tmp_path / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"
+    path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in events), encoding="utf-8")
+    info = tr.analyze(path, "原始题面")
+    assert info["ok"]
+    assert info["prompts"] == 1
+
+
+def test_trace_ignores_synthetic_interruption_message(tmp_path: Path) -> None:
+    interrupted = _event("user", "[Request interrupted by user]")
+    interrupted.pop("promptId", None)
+    events = [
+        _event("user", "原始题面", prompt_id="p1"),
+        interrupted,
         _event("assistant", "已完成"),
     ]
     path = tmp_path / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"

@@ -34,8 +34,10 @@ from common import (
     run,
     save_state,
     sha256_bytes,
+    sha256_file,
     Solo2611Error,
     utc_now,
+    write_json,
 )
 import trace as tr
 
@@ -361,6 +363,212 @@ def _final_assistant(events: list[dict[str, Any]]) -> dict[str, Any]:
         if event.get("type") == "assistant" and not event.get("isSidechain"):
             return event
     return {}
+
+
+def complete_round_prefix(
+    events: list[dict[str, Any]],
+    round_no: int = 1,
+) -> tuple[list[dict[str, Any]], int, list[str]]:
+    """Return the real event prefix through one cleanly completed round.
+
+    This helper never synthesizes an event. It only cuts an existing trace at the
+    next real user message after the requested round, and refuses the operation
+    unless that round ended with a non-error ``end_turn`` and every discarded
+    real user message is the literal ``继续``.
+    """
+    prompt_positions = [
+        index
+        for index, event in enumerate(events)
+        if tr.is_real_user_prompt(event)
+    ]
+    if round_no < 1 or len(prompt_positions) <= round_no:
+        raise Solo2611Error(
+            f"无法回切第 {round_no} 轮：之后没有可截除的继续输入"
+        )
+    start = prompt_positions[round_no - 1]
+    cut_at = prompt_positions[round_no]
+    segment = events[start:cut_at]
+    assistants = [
+        event
+        for event in segment
+        if event.get("type") == "assistant" and not event.get("isSidechain")
+    ]
+    if not assistants:
+        raise Solo2611Error(f"第 {round_no} 轮没有可确认的最终 assistant 消息")
+    final = assistants[-1]
+    message = final.get("message") if isinstance(final.get("message"), dict) else {}
+    if final.get("isApiErrorMessage") or message.get("stop_reason") != "end_turn":
+        raise Solo2611Error(
+            f"第 {round_no} 轮不是正常 end_turn，不能作为误触发继续的回切点"
+        )
+    discarded_prompts = [
+        event
+        for event in events[cut_at:]
+        if tr.is_real_user_prompt(event)
+    ]
+    if not discarded_prompts or any(not tr._is_continue(event) for event in discarded_prompts):
+        raise Solo2611Error("回切点之后存在非“继续”的真人输入，拒绝截断")
+    discarded_ids = [str(event.get("promptId") or "") for event in discarded_prompts]
+    return events[:cut_at], cut_at, discarded_ids
+
+
+def recover_round_boundary(
+    task_root: Path,
+    *,
+    round_no: int = 1,
+    reason: str,
+    execute: bool = False,
+) -> dict[str, Any]:
+    """Audit and remove trace content appended by an incorrectly sent 继续."""
+    reason = reason.strip()
+    if not reason:
+        raise Solo2611Error("recover-round 必须写明误触发继续的具体原因")
+    state = load_state(task_root)
+    session = state.get("sessionRun") or {}
+    attempt_index = int(session.get("attemptIndex") or 0)
+    attempt = _state_attempt(state, attempt_index)
+    if attempt is None:
+        raise Solo2611Error("找不到当前会话 attempt")
+    container = str(session.get("container") or attempt.get("container") or "")
+    tmux_name = str(session.get("tmuxSession") or "")
+    if supervisor_alive(state, task_root):
+        raise Solo2611Error("监督器仍在运行，先停止会话再回切轮次边界")
+    if container_running(container) or tmux_alive(tmux_name):
+        raise Solo2611Error("任务容器或 tmux 仍在运行，先停止会话再回切轮次边界")
+    live = Path(str(session.get("liveTraceDir") or ""))
+    raw_trace = _latest_trace(live)
+    if raw_trace is None:
+        raise Solo2611Error("找不到原始实时轨迹")
+    events = tr.load_events(raw_trace)
+    prefix_events, cut_event_index, discarded_ids = complete_round_prefix(events, round_no)
+    prompt_text = Path(str(state["promptPath"])).read_text(encoding="utf-8")
+    prefix_info = tr.analyze_from_events(prefix_events, prompt_text)
+    if not prefix_info.get("ok"):
+        raise Solo2611Error(
+            "回切后的轮次结构仍不完整：" + "；".join(prefix_info.get("errors") or [])
+        )
+    preview = {
+        "ok": True,
+        "execute": execute,
+        "round": round_no,
+        "sourceTrace": str(raw_trace),
+        "sourceSha256": sha256_file(raw_trace),
+        "sourceEvents": len(events),
+        "keptEvents": len(prefix_events),
+        "cutEventIndex": cut_event_index,
+        "discardedPromptIds": discarded_ids,
+        "stopReason": prefix_info.get("stopReason"),
+        "sessionId": prefix_info.get("sessionId"),
+        "promptId": prefix_info.get("promptId"),
+        "finalChars": len(str(prefix_info.get("finalText") or "")),
+    }
+    if not execute:
+        preview["hint"] = "先核对预览，再按同参数加 --execute"
+        return preview
+
+    attempt_dir = Path(str(attempt["dir"]))
+    backup = attempt_dir / f"discarded-after-round-{round_no:02d}"
+    if backup.exists():
+        raise Solo2611Error(f"回切备份目录已存在，拒绝覆盖：{backup}")
+    traces = attempt_dir / "traces"
+    if traces.exists():
+        if any(traces.rglob("*")):
+            raise Solo2611Error(f"轨迹导出目录已有内容，拒绝覆盖：{traces}")
+        traces.rmdir()
+    shutil.copytree(live, backup)
+    shutil.copytree(live, traces)
+    relative = raw_trace.relative_to(live)
+    formal_trace = traces / relative
+    raw_bytes = raw_trace.read_bytes()
+    raw_lines = raw_bytes.splitlines(keepends=True)
+    physical_events: list[int] = []
+    for line_index, raw_line in enumerate(raw_lines):
+        if not raw_line.strip():
+            continue
+        try:
+            item = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            physical_events.append(line_index)
+    if len(physical_events) != len(events):
+        raise Solo2611Error("原始轨迹事件数与物理行数无法一一对应，拒绝截断")
+    cut_line = physical_events[cut_event_index]
+    formal_trace.write_bytes(b"".join(raw_lines[:cut_line]))
+
+    info = tr.analyze(formal_trace, prompt_text)
+    review = tr.completion_review(formal_trace, info)
+    info["completion"] = review
+    info["ok"] = bool(info.get("ok")) and review["ok"]
+    info["errors"] = list(info.get("errors") or []) + list(review.get("errors") or [])
+    if not info.get("ok"):
+        raise Solo2611Error(
+            "回切后的正式轨迹未通过结构校验：" + "；".join(info.get("errors") or [])
+        )
+    info["traces"] = str(traces)
+    import solo2611 as cli
+
+    old_continues = dict(session.get("continues") or {})
+    boundary = {
+        "schema": "solo-2611/round-boundary/1",
+        "kind": "discarded-false-continue",
+        "reason": reason,
+        "round": round_no,
+        "createdAt": utc_now(),
+        "sourceTrace": str(raw_trace),
+        "sourceSha256": preview["sourceSha256"],
+        "sourceEvents": len(events),
+        "formalTrace": str(formal_trace),
+        "formalSha256": sha256_file(formal_trace),
+        "keptEvents": len(prefix_events),
+        "cutEventIndex": cut_event_index,
+        "discardedPromptIds": discarded_ids,
+        "discardedEvents": len(events) - len(prefix_events),
+        "backupTrace": str(backup / relative),
+        "rule": "仅保留首个正常 end_turn；之后误发送的“继续”及后续内容全部排除",
+    }
+    write_json(task_root / "monitor" / "round-boundary.json", boundary)
+    cli._accept_attempt(task_root, state, attempt, info)
+
+    state = load_state(task_root)
+    session = state.setdefault("sessionRun", {})
+    session["continues"] = {
+        "used": 0,
+        "max": int(old_continues.get("max") or effective_continue_max()),
+        "history": [],
+        "discardedHistory": old_continues.get("history") or [],
+    }
+    session["interrupts"] = []
+    session["discardedRounds"] = [
+        {
+            "from": round_no + 1,
+            "reason": "false-continue-after-clean-end-turn",
+            "promptIds": discarded_ids,
+        }
+    ]
+    session["boundaryRecovery"] = boundary
+    session["status"] = "accepted"
+    session["blocked"] = None
+    session["nextActionAt"] = None
+    session["outcome"] = {
+        "acceptedAt": utc_now(),
+        "remark": "已按正常完成轮次截除误触发的继续内容",
+    }
+    attempt = _state_attempt(state, attempt_index)
+    if attempt is not None:
+        attempt["continues"] = 0
+        attempt["rounds"] = 1
+        attempt["boundaryRecovery"] = boundary
+    save_state(task_root, state)
+    return {
+        **preview,
+        "execute": True,
+        "formalTrace": str(formal_trace),
+        "formalSha256": boundary["formalSha256"],
+        "sessionId": info.get("sessionId"),
+        "promptId": info.get("promptId"),
+        "next": "record",
+    }
 
 
 def classify_round(

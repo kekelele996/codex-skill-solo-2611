@@ -1070,6 +1070,17 @@ def test_completion_review_rejects_unfinished_turns(tmp_path):
     good = _trace_with_final(tmp_path, "ok2", "合并规则已实现。")
     assert not tr.completion_review(good, tr.analyze(good, PROMPT), {"is_error": True, "subtype": "error"})["ok"]
 
+    # 正常业务说明可以提到 interrupted / 中断字样；只有明确的系统中断标记才算结构中断。
+    described_state = _trace_with_final(
+        tmp_path,
+        "described-state",
+        "实例中断后已接管续跑，interrupted 状态可见，字段和页面均已完成。",
+    )
+    assert tr.completion_review(described_state, tr.analyze(described_state, PROMPT))["ok"]
+
+    interrupted = _trace_with_final(tmp_path, "interrupted", "Request interrupted by user")
+    assert not tr.completion_review(interrupted, tr.analyze(interrupted, PROMPT))["ok"]
+
 
 def test_recording_plan_terminal_and_web(tmp_path):
     terminal = recorder.write_plan(tmp_path, "terminal")

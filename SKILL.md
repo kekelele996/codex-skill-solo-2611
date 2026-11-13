@@ -37,10 +37,19 @@ description: >
   如果工程无法真实归入任一同大类子方向，直接拒绝提交。可以匹配时，只把大类保持为配置值，
   子方向填写实际匹配项。平台历史中的首条提交领域只用于交叉核验，不能反向授权跨域提交。
 - 难题只收「困难」「地狱」。首轮 170 字以内优先，绝对上限 240 字。
-- 结构不完整时不再整题重跑。限流、网关 5xx、截断、空回复、继续许诺下一步或向用户提问，
-  由监督器等待后在原会话发送字面 `继续`；继续 2 次后仍不完整就终止并换题。
-  鉴权、额度或模型名问题原地保留并等待处理，超时后终止。
-  结束标志不等于真的做完：`run`/`collect` 还会读最终回复和轨迹本身。判定结果写进轮次记录与事件日志。
+- **“继续”只服务异常结构中断，不用于正常收尾。** 最终 assistant 为 `end_turn`，回复非空，
+  没有悬空工具调用，也没有明确向用户提问、许诺尚未执行的动作或断在句子中间时，这一轮就是完成，
+  监督器不得再发 `继续`。正文里正常描述 `interrupted`、中断状态、失败重试或继续执行等业务内容，
+  不能仅凭关键词判成模型中断。
+- 只有可观察的异常结构才允许在原会话发送字面 `继续`：限流、网关 5xx、鉴权或额度问题按各自等待/保留规则；
+  `max_tokens`、空回复、明确的 `Request interrupted by user` / `API Error`、上下文耗尽、悬空工具调用、
+  最终回复提问或继续许诺下一步，才按结构不完整处理。`继续` 最多 2 次，每次必须能回指具体异常信号；
+  继续 2 次后仍不完整就终止并换题，鉴权、额度或模型名问题原地保留并等待处理，超时后终止。
+- 误发 `继续` 后立即停止监督器，不再发送第二次。若前一正常轮次是可验证的 `end_turn`，先运行
+  `recover-round --round N` 预览，核对原始轨迹哈希、截断点、保留事件数和被丢弃的 PromptID，
+  再加 `--execute` 生成正式轨迹。技能必须完整保留原始轨迹审计副本，不得改写事件内容；正式轨迹只截到
+  下一真人消息之前，之后所有误追加内容整体排除，并把 `monitor/round-boundary.json` 留作复核依据。
+- 结束标志不等于真的做完：`run`/`collect` 还会读最终回复和轨迹本身。判定结果写进轮次记录与事件日志。
 - 录屏按用户可见功能判定，不按题目自称“纯后端”或改动文件位置判定。页面能够启动时，新增/修改页面、
   页面交互、页面展示字段或状态，或者后端结果需要在页面呈现时，正式录屏必须包含该页面从入口到对应功能结果的
   真实操作；只打开页面、页面返回 200 或仅验证接口都不算页面证据。若应用因真实启动错误在页面可达前就失败，
@@ -476,6 +485,8 @@ python3 $S run --task-root ROOT [--mode supervised|print] [--follow] [--timeout 
 python3 $S run-status --task-root ROOT [--json] [--lines 20]
 python3 $S resume --task-root ROOT [--follow]
 python3 $S continue --task-root ROOT [--note TEXT]
+python3 $S recover-round --task-root ROOT --round 1 --reason "误将正常 end_turn 判为截断"
+python3 $S recover-round --task-root ROOT --round 1 --reason "同上" --execute
 python3 $S abort --task-root ROOT --reason TEXT [--by human|auto]
 python3 $S resume-all [--tasks-dir DIR] [--dry-run]
 python3 $S doctor baseline [--tasks-dir DIR] [--out FILE]
