@@ -46,6 +46,13 @@ ACTIVE = {"launching", "prompt_sent", "running", "continuing", "holding", "manua
 RUNNING_ATTEMPT_STATUSES = {"running", "start_failed", "pending_collect"}
 REPL_READY = re.compile(r"(?m)(?:^|\n)\s*(?:>|❯|›)\s*$")
 SCREEN_BUSY = re.compile(r"(?i)esc\s+to\s+interrupt|ctrl\+c\s+to\s+interrupt")
+BYPASS_WARNING = "Bypass Permissions mode"
+BYPASS_ACCEPT = "Yes, I accept"
+BYPASS_EXIT = "No, exit"
+BYPASS_OPTION = re.compile(
+    r"(?m)^\s*(?:❯|›|>|➜|→|●|○|◉|◯|\*)\s*(No, exit|Yes, I accept)\s*$"
+)
+ATTEMPT_RUNTIME_FILES = ("env.sh", "launch.sh")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
 
@@ -494,29 +501,86 @@ def _write_private(path: Path, text: str) -> None:
     os.chmod(path, 0o600 if path.name == "env.sh" else 0o700)
 
 
-def wait_for_repl(name: str, *, timeout: float = 60) -> bool:
-    deadline = time.monotonic() + timeout
-    bypass_accepted = False
+def _bypass_selection(screen: str) -> str:
+    match = BYPASS_OPTION.search(screen or "")
+    return match.group(1) if match else ""
+
+
+def _accept_bypass_prompt(name: str, screen: str, attempt: int) -> str:
+    """Choose Yes with several terminal encodings; return the strategy used."""
+    selection = _bypass_selection(screen)
+    confirm_key = "C-m" if attempt == 0 else "Enter"
+    if selection == BYPASS_EXIT:
+        run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
+        time.sleep(0.2)
+        run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
+        return "selected-no-then-down-enter"
+    if selection == BYPASS_ACCEPT:
+        run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
+        return "selected-yes-enter"
+    if attempt == 0:
+        run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
+        time.sleep(0.25)
+        refreshed = capture_pane(name, lines=30)
+        if _bypass_selection(refreshed) == BYPASS_ACCEPT:
+            run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
+            return "down-detected-yes-enter"
+        return "down-sent-await-selection"
+    run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
+    run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
+    return "blind-down-enter"
+
+
+def wait_for_repl_state(
+    name: str,
+    *,
+    timeout: float = 60,
+    confirmation_timeout: float = 12,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(1, timeout)
+    confirmation_started: float | None = None
+    confirmation_attempts = 0
+    strategies: list[str] = []
+    screen = ""
     while time.monotonic() < deadline:
-        screen = capture_pane(name, lines=30)
-        if (
-            not bypass_accepted
-            and "Bypass Permissions mode" in screen
-            and "Yes, I accept" in screen
-        ):
-            if re.search(r"(?m)^\s*❯\s*No, exit\s*$", screen):
-                run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
-                run(["tmux", "send-keys", "-t", name, "C-m"], check=False, timeout=10)
-            elif re.search(r"(?m)^\s*❯\s*Yes, I accept\s*$", screen):
-                run(["tmux", "send-keys", "-t", name, "C-m"], check=False, timeout=10)
-            bypass_accepted = True
-            time.sleep(0.8)
-            continue
-        if REPL_READY.search(screen):
-            if not _screen_busy(screen):
-                return True
+        screen = capture_pane(name, lines=40)
+        if BYPASS_WARNING in screen and BYPASS_ACCEPT in screen:
+            now = time.monotonic()
+            if confirmation_started is None:
+                confirmation_started = now
+            if confirmation_attempts < 3:
+                strategies.append(_accept_bypass_prompt(name, screen, confirmation_attempts))
+                confirmation_attempts += 1
+                time.sleep(0.8)
+                continue
+            if now - confirmation_started >= confirmation_timeout:
+                return {
+                    "ok": False,
+                    "reason": "confirmation_timeout",
+                    "confirmationAttempts": confirmation_attempts,
+                    "strategies": strategies,
+                    "screen": screen[-4000:],
+                }
+        elif REPL_READY.search(screen) and not _screen_busy(screen):
+            return {
+                "ok": True,
+                "reason": "ready",
+                "confirmationAttempts": confirmation_attempts,
+                "strategies": strategies,
+                "screen": screen[-4000:],
+            }
         time.sleep(0.5)
-    return False
+    return {
+        "ok": False,
+        "reason": "repl_timeout",
+        "confirmationAttempts": confirmation_attempts,
+        "strategies": strategies,
+        "screen": screen[-4000:],
+    }
+
+
+def wait_for_repl(name: str, *, timeout: float = 60) -> bool:
+    return bool(wait_for_repl_state(name, timeout=timeout).get("ok"))
 
 
 def send_literal(name: str, text: str) -> None:
@@ -530,6 +594,24 @@ def send_continue(name: str) -> None:
     run(["tmux", "send-keys", "-t", name, "C-m"], timeout=10)
 
 
+def _write_bypass_settings(directory: Path) -> Path:
+    """Pre-accept the image's intentional bypass mode for this isolated task."""
+    settings_dir = directory / "claude-managed-settings"
+    settings_dir.mkdir(parents=True, exist_ok=True)
+    path = settings_dir / "managed-settings.json"
+    path.write_text(
+        json.dumps({"skipDangerousModePermissionPrompt": True}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(path, 0o444)
+    return settings_dir
+
+
+def _cleanup_attempt_runtime(directory: Path) -> None:
+    _cleanup_attempt_runtime(directory)
+    shutil.rmtree(directory / "claude-managed-settings", ignore_errors=True)
+
+
 def _docker_command(
     *,
     name: str,
@@ -537,6 +619,7 @@ def _docker_command(
     workspace: Path,
     live: Path,
     image: str,
+    settings_dir: Path,
 ) -> list[str]:
     task_hash = sha256_bytes(str(task_root.resolve()).encode())[:12]
     return [
@@ -559,6 +642,8 @@ def _docker_command(
         f"type=bind,src={workspace},dst=/workspace",
         "--mount",
         f"type=bind,src={live},dst={CONTAINER_TRACE_DIR}",
+        "--mount",
+        f"type=bind,src={settings_dir},dst=/etc/claude-code,readonly",
         "-e",
         "apikey",
         "-e",
@@ -582,6 +667,7 @@ def launch_tmux_container(
     live = directory / "live"
     live.mkdir(parents=True, exist_ok=True)
     os.chmod(live, 0o777)
+    settings_dir = _write_bypass_settings(directory)
     name = _container_name(str(state["taskName"]), attempt)
     tmux_name = _tmux_name(str(state["taskName"]), attempt)
     env_path = directory / "env.sh"
@@ -598,6 +684,7 @@ def launch_tmux_container(
         workspace=workspace,
         live=live,
         image=image,
+        settings_dir=settings_dir,
     )
     _write_private(
         launch_path,
@@ -922,7 +1009,7 @@ def abort(task_root: Path, reason: str, *, by: str = "auto", detail: str = "") -
         except OSError:
             with suppress(OSError):
                 os.chmod(live, 0o555)
-    for name in ("env.sh", "launch.sh"):
+    for name in ATTEMPT_RUNTIME_FILES:
         (directory / name).unlink(missing_ok=True)
     state = load_state(task_root)
     session = state.setdefault("sessionRun", {})
@@ -1077,8 +1164,7 @@ def _close_and_accept(task_root: Path, attempt_index: int) -> dict[str, Any]:
         promptId=info.get("promptId"),
         continues=used,
     )
-    for name in ("env.sh", "launch.sh"):
-        (attempt_dir(task_root, attempt_index) / name).unlink(missing_ok=True)
+    _cleanup_attempt_runtime(attempt_dir(task_root, attempt_index))
     with suppress(OSError):
         os.chmod(attempt_dir(task_root, attempt_index) / "live", 0o555)
     return {"ok": True, "status": "accepted", "sessionId": info.get("sessionId"), "promptId": info.get("promptId")}
@@ -1191,31 +1277,45 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
         trace_reader: IncrementalTrace | None = None
         try:
             if not prompt_sent and not _trace_files(live):
-                ready = wait_for_repl(str(session.get("tmuxSession") or ""), timeout=60)
+                ready_info = wait_for_repl_state(str(session.get("tmuxSession") or ""), timeout=60)
+                ready = bool(ready_info.get("ok"))
                 while not ready and not prompt_sent and not _trace_files(live):
                     current_attempt = _state_attempt(state, attempt) or {}
                     current_attempt["startFailed"] = True
                     start_state = session.setdefault("startAttempts", {"used": 0, "max": 2})
                     used = int(start_state.get("used") or 0)
                     maximum = min(2, max(1, int(start_state.get("max") or 2)))
+                    screen_log = directory / "startup-screen.log"
+                    screen_log.write_text(str(ready_info.get("screen") or ""), encoding="utf-8")
                     append_event(
                         task_root,
                         attempt,
                         "session.start_failed",
                         attemptUsed=used,
                         maxAttempts=maximum,
+                        reason=ready_info.get("reason"),
+                        confirmationAttempts=ready_info.get("confirmationAttempts"),
+                        strategies=ready_info.get("strategies"),
+                        screen=str(screen_log),
                     )
                     _remove_tmux_and_container(
                         str(session.get("container") or ""),
                         str(session.get("tmuxSession") or ""),
                     )
-                    for name in ("env.sh", "launch.sh"):
-                        (directory / name).unlink(missing_ok=True)
+                    _cleanup_attempt_runtime(directory)
                     if used >= maximum:
                         session["status"] = "start_failed"
-                        session["error"] = "启动失败次数已用尽"
+                        reason = str(ready_info.get("reason") or "repl_timeout")
+                        session["error"] = (
+                            "Claude Code 首次权限确认未通过，已自动尝试多种确认键并重启，仍无法进入输入框"
+                            if reason == "confirmation_timeout"
+                            else "启动失败次数已用尽"
+                        )
                         current_attempt["status"] = "start_failed"
                         current_attempt["finishedAt"] = utc_now()
+                        current_attempt["errors"] = list(current_attempt.get("errors") or []) + [
+                            session["error"]
+                        ]
                         state["status"] = "prompt_ready"
                         save_state(task_root, state)
                         return
@@ -1247,7 +1347,11 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     current_attempt["container"] = launched["container"]
                     current_attempt["startFailed"] = False
                     save_state(task_root, state)
-                    ready = wait_for_repl(str(session.get("tmuxSession") or ""), timeout=60)
+                    ready_info = wait_for_repl_state(
+                        str(session.get("tmuxSession") or ""),
+                        timeout=60,
+                    )
+                    ready = bool(ready_info.get("ok"))
                 if ready and not prompt_sent:
                     send_literal(str(session.get("tmuxSession") or ""), prompt_text)
                     prompt_sent = True
@@ -1263,8 +1367,7 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                         sha256=sha256_bytes(prompt_text.encode("utf-8")),
                     )
                     append_event(task_root, attempt, "round.start", round=1)
-                    for name in ("env.sh", "launch.sh"):
-                        (directory / name).unlink(missing_ok=True)
+                    _cleanup_attempt_runtime(directory)
                     save_state(task_root, state)
             while True:
                 state = load_state(task_root)

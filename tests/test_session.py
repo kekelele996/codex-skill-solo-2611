@@ -261,6 +261,98 @@ def test_interactive_prerequisites_accept_current_tmux() -> None:
     session.assert_interactive_prereqs()
 
 
+def test_bypass_settings_are_preaccepted_for_fresh_home(tmp_path: Path) -> None:
+    settings_dir = session._write_bypass_settings(tmp_path)
+    path = settings_dir / "managed-settings.json"
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "skipDangerousModePermissionPrompt": True
+    }
+    assert path.stat().st_mode & 0o777 == 0o444
+
+
+def test_docker_command_mounts_bypass_settings(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    live = tmp_path / "live"
+    settings_dir = session._write_bypass_settings(tmp_path)
+    workspace.mkdir()
+    live.mkdir()
+    command = session._docker_command(
+        name="solo2611-test-01-abcd",
+        task_root=tmp_path / "task",
+        workspace=workspace,
+        live=live,
+        image="image",
+        settings_dir=settings_dir,
+    )
+    mount = next(
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--mount"
+        and command[index + 1].endswith("dst=/etc/claude-code,readonly")
+    )
+    assert f"src={settings_dir}" in mount
+
+
+def test_bypass_prompt_handles_wrapped_option_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    screens = iter(
+        [
+            "Bypass Permissions mode\n❯ No, exit\n  Yes, I accept",
+            "Bypass Permissions mode\n  No, exit\n› Yes, I accept",
+            "❯ ",
+        ]
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(session, "capture_pane", lambda *_args, **_kwargs: next(screens))
+    monkeypatch.setattr(session.time, "sleep", lambda _seconds: None)
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(session, "run", fake_run)
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert result["confirmationAttempts"] == 2
+    assert result["strategies"][0] == "selected-no-then-down-enter"
+    assert result["strategies"][1] == "selected-yes-enter"
+    assert [call[-1] for call in calls] == ["Down", "C-m", "Enter"]
+
+
+def test_bypass_prompt_times_out_without_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(
+        session,
+        "capture_pane",
+        lambda *_args, **_kwargs: "Bypass Permissions mode\nNo, exit\nYes, I accept",
+    )
+    monkeypatch.setattr(session.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        session.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + float(seconds)),
+    )
+    monkeypatch.setattr(
+        session,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
+
+    result = session.wait_for_repl_state(
+        "tmux-test",
+        timeout=8,
+        confirmation_timeout=3,
+    )
+
+    assert result["ok"] is False
+    assert result["reason"] == "confirmation_timeout"
+    assert result["confirmationAttempts"] == 3
+
+
 def test_open_session_terminal_uses_terminal_app(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

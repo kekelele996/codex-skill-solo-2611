@@ -249,6 +249,8 @@ python3 $S config set claude.openTerminalOnRun=true   # 首次启动受管会话
    受管模式前置要求 `tmux >= 3.0` 且宿主机不是 Windows；不满足时显式阻断，可切回 print。
    `claude.openTerminalOnRun=true` 时，新会话会另开一个可见的 macOS Terminal 窗口并接入 tmux；
    关闭终端窗口只退出查看，不停止任务。默认 `false`，避免无人值守和录屏时弹窗。
+   新机器首次进入 REPL 时，技能通过只读 managed settings 预接受镜像既定的 Bypass Permissions 模式；
+   若未来版本仍显示确认页，会在 12 秒内尝试多种选择键，超时即重启并记录屏幕快照，不能一直卡在确认页。
    总时长默认 10800 秒，无进展或静默默认 1200 秒；退出开机会话后导出完整 Claude projects 目录，
    校验题面、继续次数、最终轮次、SessionID 和 PromptID，再打产物快照、生成轨迹时间线并推送。
 

@@ -1,5 +1,19 @@
 # 实测记录
 
+## 2026-11-14 新机器首次权限确认页兼容
+
+- 新机器截图显示 Claude Code 停在 Bypass Permissions 确认页。根因是每次容器都使用全新的
+  `/home/node`，首个容器的 `skipDangerousModePermissionPrompt` 不会跨容器保留；旧实现只识别
+  固定 `❯` 选项标记，标记变化或按键未生效时会一直等到 60 秒启动超时。
+- 启动前现在只读挂载 `/etc/claude-code/managed-settings.json`，预置
+  `{"skipDangerousModePermissionPrompt": true}`。该设置属于 managed policy，
+  不受镜像 `--setting-sources ''` 影响。
+- 兜底会识别 `❯`、`›`、`>` 等选择标记；选中 `No, exit` 时按 `Down + Enter`，
+  选中 `Yes, I accept` 时直接确认。确认页 12 秒未消失即记录 `startup-screen.log` 并重试，
+  用尽启动次数后给出明确错误，不再无限等待。
+- 隔离容器实测：新临时 HOME 首次启动 `confirmationAttempts=0`，直接进入 REPL；
+  窄体 `›` 标记与超时路径由自动化测试覆盖。
+
 ## 2026-11-13 v4 受管交互探针
 
 - 已在隔离任务 `/tmp/solo2611-accept/2026-11-13-v4-interactive-probe-ujhv` 用官方镜像实测：
