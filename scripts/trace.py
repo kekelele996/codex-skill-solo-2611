@@ -121,9 +121,18 @@ def _text_of(content: Any) -> str:
 def is_real_user_prompt(event: dict[str, Any]) -> bool:
     if event.get("type") != "user" or event.get("isMeta") or event.get("isSidechain") or event.get("isCompactSummary"):
         return False
+    if str(event.get("promptSource") or "").lower() == "system":
+        return False
+    origin = event.get("origin")
+    if isinstance(origin, dict) and str(origin.get("kind") or "") in {
+        "task-notification",
+        "system-reminder",
+    }:
+        return False
     content = _content(event)
     if isinstance(content, str):
-        return bool(content.strip())
+        text = content.strip()
+        return bool(text) and not text.startswith(("<system-reminder>", "<task-notification>"))
     if isinstance(content, list):
         if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             return False

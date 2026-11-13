@@ -181,8 +181,30 @@ def test_trace_rejects_human_intervention(tmp_path: Path) -> None:
     assert any("非“继续”" in item for item in info["errors"])
 
 
+def test_trace_ignores_background_task_notifications(tmp_path: Path) -> None:
+    notification = _event(
+        "user",
+        "<task-notification>\n<task-id>bg-1</task-id>\n<status>completed</status>\n</task-notification>",
+        prompt_id="system-p2",
+    )
+    notification["promptSource"] = "system"
+    notification["origin"] = {"kind": "task-notification", "producer": "session-task"}
+    events = [
+        _event("user", "原始题面", prompt_id="p1"),
+        notification,
+        _event("assistant", "已完成"),
+    ]
+    path = tmp_path / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"
+    path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in events), encoding="utf-8")
+    info = tr.analyze(path, "原始题面")
+    assert info["ok"]
+    assert info["prompts"] == 1
+
+
 def test_continue_hard_limit_and_remark() -> None:
     assert session.CONTINUE_HARD_LIMIT == 2
+    assert session.effective_continue_max({"claude": {"continueMax": 0}}) == 0
+    assert session.effective_continue_max({"claude": {"continueMax": 9}}) == 2
     remark = tr.submission_remark(
         {"sessionRun": {"continues": {"used": 2}}},
         api_key_remark=tr.PLAINTEXT_API_KEY_REMARK,

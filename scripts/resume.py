@@ -76,13 +76,7 @@ def resume_print(task_root: Path) -> dict[str, Any]:
     if attempt is None:
         return {"ok": False, "status": "idle", "message": "没有需要接回的运行中尝试"}
     pid = attempt.get("pid")
-    if _alive(pid):
-        return {
-            "ok": True,
-            "status": "running",
-            "message": "原运行进程仍在，无需重复接回",
-            "pid": int(pid),
-        }
+    detached_process_alive = _alive(pid)
     name = str(attempt.get("container") or "")
     status = _container_status(name)
     if not status:
@@ -121,4 +115,8 @@ def resume_print(task_root: Path) -> dict[str, Any]:
                 attempt["timeoutKind"] = "total"
                 run(["docker", "stop", "-t", "10", name], check=False, timeout=60)
                 break
+        if detached_process_alive:
+            attempt["reattachedAt"] = utc_now()
+            attempt["reattachedFromPid"] = int(pid)
+            save_state(task_root, state)
     return _collect_print_attempt(task_root, state, attempt)
