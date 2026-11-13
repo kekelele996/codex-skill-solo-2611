@@ -28,7 +28,7 @@
 
 | 方式 | 命令 | 轨迹 `entrypoint` | 说明 |
 |---|---|---|---|
-| 受管交互（默认） | `run` → tmux + 独立监督器 | `cli` | 逐字发送题面后以轨迹确认送达；8/20/36/50 秒自动补按回车或同文重发，75 秒仍无匹配 prompt 才按启动失败重排。确认后仅结构异常时在同一会话发送字面 `继续`，最多 2 次，不整题重跑 |
+| 受管交互（默认） | `run` → tmux + 独立监督器 | `cli` | 逐字发送题面后以轨迹确认送达；8/20/36/50 秒自动补按回车或同文重发，75 秒仍无匹配 prompt 才按启动失败重排。确认后仅明确 API/接口故障可发送字面 `继续`，最多 2 次；正常结束立即终止 |
 | print（回退） | `run --mode print` | `sdk-cli` | 无头执行，一次机会、无自动继续；用于交互 TUI 或容器环境不可用时的保守回退 |
 | 手工交互 | `interactive` → 专家粘贴 → `collect` | `cli` | 保留为专家排障入口；不提供自动继续 |
 
@@ -46,8 +46,9 @@ tmux 命令行、`ps` 输出和 `launch.sh` 都不包含 Key。题面发出后�
 
 - 主会话：`traces/-workspace/<sessionId>.jsonl`；子代理轨迹在 `traces/-workspace/<sessionId>/subagents/`。
 - 真人消息：`type=user`、带 `promptId`、`version=2.1.303`。
-- 结束判断：最后一条主线 assistant 的 `message.stop_reason=end_turn` 且不是 `isApiErrorMessage`，
-  同时没有悬空工具调用、明确提问、未执行许诺或句子中断。正文里的业务词 `interrupted` 不是系统中断信号。
+- 结束判断：最后一条主线 assistant 的 `message.stop_reason=end_turn` 且不是 `isApiErrorMessage`。
+  自动继续只接受明确 API/接口故障；正常结束里的提问、提交/推送/PR询问或“下一步可以”都不是接口故障。
+- 正常结束直接进入终态，不自动恢复、不录屏、不导出、不提交。
 - 误触发继续：监督器必须停止；可用 `recover-round` 在保留原始轨迹副本和哈希的前提下，截到正常完成轮次，
   不得向同一会话再补发“继续”。
 - print 模式 stdout 最后有 `type=result`，`is_error`/`api_error_status` 可直接判断鉴权或网关故障。

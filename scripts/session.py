@@ -73,6 +73,26 @@ BYPASS_OPTION = re.compile(
 ATTEMPT_RUNTIME_FILES = ("env.sh", "launch.sh")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
+RATE_LIMIT_SIGNAL = re.compile(
+    r"(?i)(?:rate.?limit|tokens per minute|too many requests|"
+    r"\b(?:http|status|error|api)\s*[:=]?\s*429\b|\b429\s+(?:too many requests|rate limited)\b)"
+)
+GATEWAY_SIGNAL = re.compile(
+    r"(?i)(?:\b(?:http|status|error|api)\s*[:=]?\s*5\d\d\b|"
+    r"\b5\d\d\s+(?:bad gateway|service unavailable|gateway timeout|overloaded)\b|"
+    r"\b(?:bad gateway|service unavailable|gateway timeout|overloaded)\b)"
+)
+CONTINUABLE_INTERFACE_ERROR = re.compile(
+    r"(?i)(?:"
+    r"\[?Request interrupted by user\]?|Request was aborted|"
+    r"\bAPI Error(?::|\b)|"
+    r"stream(?:ing)?(?: response)? (?:error|failed|interrupted|closed)|"
+    r"connection (?:reset|aborted|closed unexpectedly)|"
+    r"upstream (?:connect|request) (?:error|failed)|"
+    r"网络连接(?:中断|异常)|流式响应(?:错误|中断|失败)"
+    r")"
+)
+CONTINUABLE_KINDS = {"rate_limited", "gateway", "api_error", "request_interrupted"}
 
 
 def assert_interactive_prereqs() -> None:
@@ -233,6 +253,25 @@ def effective_continue_max(config: dict[str, Any] | None = None) -> int:
     except (TypeError, ValueError):
         value = 2
     return min(CONTINUE_HARD_LIMIT, max(0, value))
+
+
+def continuation_trigger(session: dict[str, Any]) -> str:
+    """Return the explicit API/interface failure that permits another round."""
+    candidates = [session.get("pendingContinue")]
+    blocked = session.get("blocked")
+    if isinstance(blocked, dict):
+        candidates.append(blocked.get("kind"))
+    rounds = session.get("rounds") or []
+    if rounds and isinstance(rounds[-1], dict):
+        candidates.append(rounds[-1].get("kind"))
+    interrupts = session.get("interrupts") or []
+    if interrupts and isinstance(interrupts[-1], dict):
+        candidates.append(interrupts[-1].get("kind"))
+    for value in candidates:
+        kind = str(value or "")
+        if kind in CONTINUABLE_KINDS:
+            return kind
+    return ""
 
 
 def _pid_alive(pid: Any) -> bool:
@@ -600,54 +639,70 @@ def classify_round(
     text = tr._text_of(message.get("content")).strip()
     stop_reason = str(info.get("stopReason") or message.get("stop_reason") or "")
     api_error = bool(final.get("isApiErrorMessage")) or bool((result or {}).get("is_error"))
-    lowered = text.lower()
+    if RATE_LIMIT_SIGNAL.search(text) or (
+        api_error and re.search(r"\b429\b", text)
+    ):
+        match = RETRY_AFTER.search(text)
+        retry_after = int(match.group(1)) if match else 0
+        return {
+            "kind": "rate_limited",
+            "verdict": "continue",
+            "waitSeconds": max(120, retry_after),
+            "detail": text[:500] or "429 rate limited",
+        }
+    if GATEWAY_SIGNAL.search(text) or (
+        api_error and re.search(r"(?i)\b5\d\d\b", text)
+    ):
+        return {
+            "kind": "gateway",
+            "verdict": "continue",
+            "waitSeconds": 180 if gateway_failures else 60,
+            "detail": text[:500],
+        }
     if api_error:
-        if "429" in text or "rate limit" in lowered or "tokens per minute" in lowered:
-            match = RETRY_AFTER.search(text)
-            retry_after = int(match.group(1)) if match else 0
-            return {
-                "kind": "rate_limited",
-                "verdict": "continue",
-                "waitSeconds": max(120, retry_after),
-                "detail": text[:500] or "429 rate limited",
-            }
-        if re.search(r"(?i)\b5\d\d\b|overloaded|gateway|bad gateway|service unavailable", text):
-            return {
-                "kind": "gateway",
-                "verdict": "continue",
-                "waitSeconds": 180 if gateway_failures else 60,
-                "detail": text[:500],
-            }
         if re.search(r"(?i)\b401\b|\b403\b|authentication|invalid.?api.?key|鉴权", text):
             return {"kind": "auth", "verdict": "hold", "waitSeconds": 0, "detail": text[:500]}
         if re.search(r"(?i)quota|insufficient.?balance|额度(不足|用尽)|\b402\b", text):
             return {"kind": "quota", "verdict": "hold", "waitSeconds": 0, "detail": text[:500]}
+        return {
+            "kind": "api_error",
+            "verdict": "continue",
+            "waitSeconds": 30,
+            "detail": text[:500] or "API error",
+        }
     if re.search(r"(?i)unrecognized_model|model.?not.?found|invalid model|模型名", text):
         return {"kind": "model_mismatch", "verdict": "hold", "waitSeconds": 0, "detail": text[:500]}
+    if CONTINUABLE_INTERFACE_ERROR.search(text):
+        return {
+            "kind": "request_interrupted",
+            "verdict": "continue",
+            "waitSeconds": 5,
+            "detail": text[-500:],
+        }
     if stop_reason == "max_tokens":
-        return {"kind": "truncated", "verdict": "continue", "waitSeconds": 5, "detail": "max_tokens"}
+        return {"kind": "truncated", "verdict": "terminate", "waitSeconds": 0, "detail": "max_tokens"}
     dangling = dangling_tool_calls(events)
     if dangling:
         return {
             "kind": "truncated",
-            "verdict": "continue",
-            "waitSeconds": 5,
+            "verdict": "terminate",
+            "waitSeconds": 0,
             "detail": f"{len(dangling)} 个工具调用没有结果",
         }
     if tr.CUT_OFF.search(text):
-        return {"kind": "truncated", "verdict": "continue", "waitSeconds": 5, "detail": text[-500:]}
+        return {"kind": "truncated", "verdict": "terminate", "waitSeconds": 0, "detail": text[-500:]}
     if text and tr.INCOMPLETE_TAIL.search(text[-400:]):
-        return {"kind": "truncated", "verdict": "continue", "waitSeconds": 5, "detail": text[-500:]}
+        return {"kind": "truncated", "verdict": "terminate", "waitSeconds": 0, "detail": text[-500:]}
     if not text:
-        return {"kind": "empty", "verdict": "continue", "waitSeconds": 5, "detail": "最终回复为空"}
+        return {"kind": "empty", "verdict": "terminate", "waitSeconds": 0, "detail": "最终回复为空"}
     if tr.ASKING_USER.search(text[-500:]) or tr.PLAN_PROMISE.search(text[-500:]):
-        return {"kind": "incomplete", "verdict": "continue", "waitSeconds": 5, "detail": text[-500:]}
+        return {"kind": "incomplete", "verdict": "terminate", "waitSeconds": 0, "detail": text[-500:]}
     if stop_reason == "end_turn":
-        return {"kind": "none", "verdict": "complete", "waitSeconds": 0, "detail": ""}
+        return {"kind": "normal_end", "verdict": "terminate", "waitSeconds": 0, "detail": text[-500:]}
     return {
-        "kind": "truncated",
-        "verdict": "continue",
-        "waitSeconds": 5,
+        "kind": "incomplete",
+        "verdict": "terminate",
+        "waitSeconds": 0,
         "detail": f"stop_reason={stop_reason or 'missing'}",
     }
 
@@ -1328,6 +1383,8 @@ def human_continue(task_root: Path, *, note: str = "") -> dict[str, Any]:
         raise Solo2611Error("会话已终止，不能继续")
     if session.get("mode") != "supervised":
         raise Solo2611Error("print 模式不支持继续")
+    if not continuation_trigger(session):
+        raise Solo2611Error("当前轮次不是明确 API/接口故障，禁止发送继续")
     continues = session.get("continues") or {}
     used, maximum = int(continues.get("used") or 0), int(continues.get("max") or 0)
     if used >= maximum:
@@ -1472,7 +1529,7 @@ def _record_round(
         rounds[-1] = item
     else:
         rounds.append(item)
-    if classification["verdict"] != "complete":
+    if classification["verdict"] not in {"complete", "terminate"}:
         interrupts = session.setdefault("interrupts", [])
         interrupts.append({"round": number, "kind": classification["kind"], "at": utc_now()})
     return item
@@ -1595,6 +1652,15 @@ def _handle_human_commands(
     changed = False
     for command in commands:
         if command.get("command") != "continue":
+            continue
+        if not continuation_trigger(session):
+            append_event(
+                task_root,
+                attempt,
+                "continue.rejected",
+                reason="no_api_interface_failure",
+                sentBy="human",
+            )
             continue
         continues = session.setdefault("continues", {"used": 0, "max": 0, "history": []})
         used, maximum = int(continues.get("used") or 0), min(CONTINUE_HARD_LIMIT, int(continues.get("max") or 0))
@@ -1933,9 +1999,19 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                                     waitSeconds=classification.get("waitSeconds", 0),
                                 )
                                 session = state["sessionRun"]
-                                if classification["verdict"] == "complete":
+                                if classification["verdict"] in {"complete", "terminate"}:
                                     save_state(task_root, state)
-                                    result = _close_and_accept(task_root, attempt)
+                                    reason = (
+                                        "normal_end_no_auto_advance"
+                                        if classification["kind"] == "normal_end"
+                                        else f"terminal_{classification['kind']}"
+                                    )
+                                    result = abort(
+                                        task_root,
+                                        reason,
+                                        by="auto",
+                                        detail=str(classification.get("detail") or ""),
+                                    )
                                     print(json.dumps(result, ensure_ascii=False))
                                     return
                                 if classification["verdict"] == "hold":

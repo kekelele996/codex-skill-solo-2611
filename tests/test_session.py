@@ -24,7 +24,7 @@ import feedback as fb  # noqa: E402
 import resume as print_resume  # noqa: E402
 import session  # noqa: E402
 import trace as tr  # noqa: E402
-from common import load_state, save_state  # noqa: E402
+from common import Solo2611Error, load_state, save_state  # noqa: E402
 
 
 def _event(kind: str, text: str = "", *, prompt_id: str = "", stop: str | None = None) -> dict:
@@ -96,16 +96,23 @@ def _task_root(tmp_path: Path) -> Path:
     ("text", "is_error", "stop", "kind", "verdict"),
     [
         ("429 Tokens Per Minute", True, "stop_sequence", "rate_limited", "continue"),
+        ("429 Too Many Requests", False, "stop_sequence", "rate_limited", "continue"),
         ("503 overloaded", True, "stop_sequence", "gateway", "continue"),
+        ("HTTP 503 Service Unavailable", False, "stop_sequence", "gateway", "continue"),
+        ("API Error: upstream failed", True, "stop_sequence", "api_error", "continue"),
         ("401 authentication", True, "stop_sequence", "auth", "hold"),
         ("quota exceeded", True, "stop_sequence", "quota", "hold"),
-        ("normal answer", False, "max_tokens", "truncated", "continue"),
-        ("上下文已满", False, "end_turn", "truncated", "continue"),
-        ("批次状态为 interrupted，但字段、页面和验证均已完成。", False, "end_turn", "none", "complete"),
-        ("Request interrupted by user", False, "end_turn", "truncated", "continue"),
-        ("", False, "end_turn", "empty", "continue"),
-        ("需要我继续吗？", False, "end_turn", "incomplete", "continue"),
-        ("已完成", False, "end_turn", "none", "complete"),
+        ("normal answer", False, "max_tokens", "truncated", "terminate"),
+        ("上下文已满", False, "end_turn", "truncated", "terminate"),
+        ("批次状态为 interrupted，但字段、页面和验证均已完成。", False, "end_turn", "normal_end", "terminate"),
+        ("Request interrupted by user", False, "end_turn", "request_interrupted", "continue"),
+        ("streaming response error", False, "end_turn", "request_interrupted", "continue"),
+        ("", False, "end_turn", "empty", "terminate"),
+        ("需要我继续吗？", False, "end_turn", "incomplete", "terminate"),
+        ("需要我提交、推送或开 PR 吗？", False, "end_turn", "incomplete", "terminate"),
+        ("下一步可以补测试。", False, "end_turn", "normal_end", "terminate"),
+        ("已完成", False, "end_turn", "normal_end", "terminate"),
+        ("处理了500行数据，已完成", False, "end_turn", "normal_end", "terminate"),
     ],
 )
 def test_classify_round_table(
@@ -122,6 +129,42 @@ def test_classify_round_table(
     result = session.classify_round(info, None, events)
     assert result["kind"] == kind
     assert result["verdict"] == verdict
+
+
+def test_terminal_normal_end_is_not_recorded_as_model_interrupt() -> None:
+    events = [_event("user", "原始题面", prompt_id="p1"), _event("assistant", "是否提交由你决定。")]
+    state = {
+        "sessionRun": {
+            "status": "running",
+            "lastRoundStartedAt": "2026-11-14T01:00:00Z",
+            "rounds": [],
+            "interrupts": [],
+        }
+    }
+    item = session._record_round(
+        state,
+        events,
+        {
+            "kind": "incomplete",
+            "verdict": "terminate",
+            "detail": "是否提交由你决定。",
+        },
+    )
+    assert item["verdict"] == "terminate"
+    assert state["sessionRun"]["interrupts"] == []
+
+
+def test_continuation_trigger_only_accepts_api_interface_failures() -> None:
+    assert session.continuation_trigger({"pendingContinue": "rate_limited"}) == "rate_limited"
+    assert session.continuation_trigger({"rounds": [{"kind": "gateway"}]}) == "gateway"
+    assert session.continuation_trigger({"rounds": [{"kind": "normal_end"}]}) == ""
+    assert session.continuation_trigger({"blocked": {"kind": "auth"}}) == ""
+
+
+def test_human_continue_rejects_normal_end_without_api_failure(tmp_path: Path) -> None:
+    root = _task_root(tmp_path)
+    with pytest.raises(Solo2611Error, match="明确 API/接口故障"):
+        session.human_continue(root)
 
 
 def test_round_ended_requires_trace_and_screen_idle() -> None:
