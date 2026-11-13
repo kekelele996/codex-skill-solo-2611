@@ -46,6 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "continueMax": 2,
         "startAttempts": 2,
         "fatalHoldMinutes": 30,
+        "openTerminalOnRun": False,
     },
     "tasksDir": str(DEFAULT_TASKS_DIR),
     "git": {"userName": "solo-2611", "userEmail": "solo-2611@local"},
@@ -143,6 +144,7 @@ def load_config() -> dict[str, Any]:
         claude.setdefault("silentSeconds", 1200)
         claude.setdefault("noProgressSeconds", 1200)
         claude.setdefault("fatalHoldMinutes", 30)
+        claude.setdefault("openTerminalOnRun", False)
         claude["timeoutSeconds"] = max(10800, int(claude.get("timeoutSeconds") or 10800))
         config["configVersion"] = 4
     claude = config.setdefault("claude", {})
@@ -152,6 +154,12 @@ def load_config() -> dict[str, Any]:
     claude["silentSeconds"] = max(60, int(claude.get("silentSeconds") or 1200))
     claude["noProgressSeconds"] = max(60, int(claude.get("noProgressSeconds") or 1200))
     claude["fatalHoldMinutes"] = max(1, int(claude.get("fatalHoldMinutes") or 30))
+    raw_open_terminal = claude.get("openTerminalOnRun", False)
+    claude["openTerminalOnRun"] = (
+        raw_open_terminal
+        if isinstance(raw_open_terminal, bool)
+        else str(raw_open_terminal).strip().lower() in {"1", "true", "yes", "on"}
+    )
     if claude.get("runMode") not in {"supervised", "print"}:
         claude["runMode"] = "supervised"
     return config

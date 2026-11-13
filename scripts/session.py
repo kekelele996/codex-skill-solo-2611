@@ -63,6 +63,72 @@ def assert_interactive_prereqs() -> None:
         raise Solo2611Error(f"受管交互模式需要 tmux >= 3.0，当前为 {text or '未知'}")
 
 
+def open_session_terminal(tmux_name: str) -> dict[str, Any]:
+    """Open a visible Terminal window attached to the managed tmux session."""
+    if sys.platform != "darwin":
+        return {
+            "requested": True,
+            "opened": False,
+            "error": "自动打开可见终端目前只支持 macOS",
+        }
+    try:
+        if not tmux_name or not tmux_alive(tmux_name):
+            return {
+                "requested": True,
+                "opened": False,
+                "error": f"tmux 会话不存在: {tmux_name}",
+            }
+        command = f"tmux attach-session -t {shlex.quote(tmux_name)}"
+        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+        script = (
+            'tell application "Terminal"\n'
+            "  activate\n"
+            f'  do script "{escaped}"\n'
+            "end tell"
+        )
+        result = run(["osascript", "-e", script], check=False, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {
+            "requested": True,
+            "opened": False,
+            "error": f"打开 Terminal.app 失败: {exc}",
+        }
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        return {
+            "requested": True,
+            "opened": False,
+            "error": error[-500:] or "打开 Terminal.app 失败",
+        }
+    return {
+        "requested": True,
+        "opened": True,
+        "app": "Terminal",
+        "tmux": tmux_name,
+    }
+
+
+def maybe_open_session_terminal(
+    task_root: Path,
+    attempt: int,
+    tmux_name: str,
+) -> dict[str, Any]:
+    claude = load_config().get("claude") or {}
+    enabled = bool(claude.get("openTerminalOnRun", False))
+    if not enabled:
+        return {"requested": False, "opened": False}
+    result = open_session_terminal(tmux_name)
+    append_event(
+        task_root,
+        attempt,
+        "terminal.visible_open",
+        opened=result.get("opened") is True,
+        app=result.get("app"),
+        error=result.get("error"),
+    )
+    return result
+
+
 def _parse_time(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -686,12 +752,14 @@ def start_supervised(
     session["tmuxSession"] = launched["tmux"]
     session["startAttempts"]["used"] = int(session["startAttempts"].get("used") or 0) + 1
     pid = spawn_supervisor(task_root=task_root, attempt=attempt_index)
+    terminal = maybe_open_session_terminal(task_root, attempt_index, launched["tmux"])
     session["supervisor"] = {
         "pid": pid,
         "pgid": pid,
         "startedAt": utc_now(),
         "heartbeatAt": utc_now(),
     }
+    session["visibleTerminal"] = terminal
     save_state(task_root, state)
     return {
         "ok": True,
@@ -700,6 +768,8 @@ def start_supervised(
         "container": launched["container"],
         "tmux": launched["tmux"],
         "supervisor": pid,
+        "terminalOpened": terminal.get("opened") is True,
+        "terminalError": terminal.get("error"),
         "next": "run-status",
     }
 
@@ -1169,6 +1239,11 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     start_state["used"] = used + 1
                     session["container"] = launched["container"]
                     session["tmuxSession"] = launched["tmux"]
+                    session["visibleTerminal"] = maybe_open_session_terminal(
+                        task_root,
+                        attempt,
+                        launched["tmux"],
+                    )
                     current_attempt["container"] = launched["container"]
                     current_attempt["startFailed"] = False
                     save_state(task_root, state)

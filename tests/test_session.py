@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -258,6 +259,64 @@ def test_continue_marks_only_latest_round() -> None:
 
 def test_interactive_prerequisites_accept_current_tmux() -> None:
     session.assert_interactive_prereqs()
+
+
+def test_open_session_terminal_uses_terminal_app(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(session.sys, "platform", "darwin")
+    monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        calls.append(command)
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(session, "run", fake_run)
+    result = session.open_session_terminal("solo2611-safe-name")
+    assert result["opened"] is True
+    assert calls and calls[0][:2] == ["osascript", "-e"]
+    script = calls[0][2]
+    assert 'tell application "Terminal"' in script
+    assert "tmux attach-session -t solo2611-safe-name" in script
+
+
+def test_open_session_terminal_is_optional(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _task_root(tmp_path)
+    monkeypatch.setattr(
+        session,
+        "load_config",
+        lambda: {"claude": {"openTerminalOnRun": False}},
+    )
+    called = False
+
+    def unexpected(_: str) -> dict:
+        nonlocal called
+        called = True
+        return {"opened": True}
+
+    monkeypatch.setattr(session, "open_session_terminal", unexpected)
+    result = session.maybe_open_session_terminal(root, 1, "solo2611-safe-name")
+    assert result == {"requested": False, "opened": False}
+    assert called is False
+
+
+def test_open_session_terminal_timeout_does_not_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(session.sys, "platform", "darwin")
+    monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+
+    def timeout(command: list[str], **_: object) -> SimpleNamespace:
+        raise session.subprocess.TimeoutExpired(command, 15)
+
+    monkeypatch.setattr(session, "run", timeout)
+    result = session.open_session_terminal("solo2611-safe-name")
+    assert result["opened"] is False
+    assert "timed out" in result["error"]
 
 
 def test_abort_is_terminal_and_writes_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

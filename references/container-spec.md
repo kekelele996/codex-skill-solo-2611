@@ -38,6 +38,10 @@
 `/home/node/.claude/projects`，用于实时读取轨迹。Token 写入权限为 `0600` 的临时 `env.sh`；
 tmux 命令行、`ps` 输出和 `launch.sh` 都不包含 Key。题面发出后立即删除密钥临时文件。
 
+`claude.openTerminalOnRun=true` 时，技能会用 macOS AppleScript 新开 Terminal 窗口并执行
+`tmux attach-session -t <会话名>`。该窗口只负责显示；关闭窗口或按 `Ctrl+B`、`D` 脱离不会停止
+监督器和容器。默认关闭，避免无人值守运行、自动恢复和录屏阶段被弹窗打扰。
+
 ## 轨迹结构（实测）
 
 - 主会话：`traces/-workspace/<sessionId>.jsonl`；子代理轨迹在 `traces/-workspace/<sessionId>/subagents/`。

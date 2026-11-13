@@ -1,6 +1,6 @@
 # codex-skill-solo-2611
 
-`solo-2611` v0.6.0：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
+`solo-2611` v0.6.1：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
 
 支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session；结构中断时只在原会话发送字面“继续”，最多 2 次。技能负责题面门禁、快照、受管会话、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
 
@@ -18,6 +18,7 @@ rsync -a ./dependencies/solo-annotation-loop/ "$HOME/.codex/skills/solo-annotati
 Python 运行时需要：
 
 系统还需要 `tmux >= 3.0`；受管交互是 v0.6.0 的默认运行模式。
+如需在任务启动时看到真实交互终端，可设置 `claude.openTerminalOnRun=true`；默认仍在后台运行。
 
 ```bash
 python3 -m pip install -r requirements.txt
