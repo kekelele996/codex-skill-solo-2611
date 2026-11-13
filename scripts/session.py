@@ -1319,7 +1319,7 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
 def resume_session(task_root: Path) -> dict[str, Any]:
     state = load_state(task_root)
     session = state.get("sessionRun") or {}
-    if session.get("mode") == "print":
+    if not session or session.get("mode") == "print":
         import resume as print_resume
 
         return print_resume.resume_print(task_root)

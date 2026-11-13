@@ -19,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import doctor  # noqa: E402
 import feedback as fb  # noqa: E402
+import resume as print_resume  # noqa: E402
 import session  # noqa: E402
 import trace as tr  # noqa: E402
 from common import load_state, save_state  # noqa: E402
@@ -236,6 +237,22 @@ def test_abort_is_terminal_and_writes_evidence(tmp_path: Path, monkeypatch: pyte
     assert state["sessionRun"]["abort"]["reason"] == "人工放弃"
     assert (root / "delivery" / "终止说明.md").is_file()
     assert not session.abort(root, "再次放弃")["ok"]
+
+
+def test_legacy_state_without_session_run_routes_to_print_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _task_root(tmp_path)
+    state = load_state(root)
+    state.pop("sessionRun", None)
+    save_state(root, state)
+
+    def fake_resume(_: Path) -> dict[str, object]:
+        return {"ok": True, "status": "legacy", "source": "print"}
+
+    monkeypatch.setattr(print_resume, "resume_print", fake_resume)
+    assert session.resume_session(root)["status"] == "legacy"
 
 
 def test_feedback_caps_model_caused_continue(tmp_path: Path) -> None:
