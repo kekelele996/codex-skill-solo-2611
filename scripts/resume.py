@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import fcntl
 from pathlib import Path
 from typing import Any
 
@@ -70,6 +71,24 @@ def _collect_print_attempt(task_root: Path, state: dict[str, Any], attempt: dict
 
 
 def resume_print(task_root: Path) -> dict[str, Any]:
+    lock_path = task_root / "monitor" / ".resume.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {
+                "ok": True,
+                "status": "running",
+                "message": "已有进程在接回这条旧版 print 会话",
+            }
+        try:
+            return _resume_print_locked(task_root)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _resume_print_locked(task_root: Path) -> dict[str, Any]:
     """Reattach to the one running opportunity without creating a new one."""
     state = load_state(task_root)
     attempt = last_running_attempt(state)

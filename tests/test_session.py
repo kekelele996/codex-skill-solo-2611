@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import fcntl
 import sys
 import tempfile
 import time
@@ -276,6 +277,21 @@ def test_legacy_state_without_session_run_routes_to_print_resume(
 
     monkeypatch.setattr(print_resume, "resume_print", fake_resume)
     assert session.resume_session(root)["status"] == "legacy"
+
+
+def test_print_resume_singleton_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _task_root(tmp_path)
+    lock_path = root / "monitor" / ".resume.lock"
+    with lock_path.open("a+") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        monkeypatch.setattr(
+            print_resume,
+            "_resume_print_locked",
+            lambda _: {"ok": True, "status": "unexpected"},
+        )
+        result = print_resume.resume_print(root)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    assert result["status"] == "running"
 
 
 def test_feedback_caps_model_caused_continue(tmp_path: Path) -> None:
