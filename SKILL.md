@@ -131,10 +131,13 @@ python3 $S resume --task-root ROOT
 1. 按实际领域读取对应出题参考：数据工程读 `references/data-engineering-topics.md`，
    游戏图形与多媒体参考 `references/graphics-topics.md`，安全围绕漏洞攻防、身份认证、
    通信安全或系统安全的真实工程边界。任一大类下的全部合法子方向都可以用于出题。
-2. 读真实源码，至少找到 2–3 个相关业务文件、现有数据流和一条可观察的失败后果。
-3. 读 `references/prompt-standard.md` 和 `references/difficulty-standard.md`。
-4. 运行 `prompt --init` 生成题面草稿、`difficulty-review.json` 和 `ra-renhua-review.json`。
-5. 只有难度论证能逐项回指题面原句和真实源码文件时才允许安装提示词。
+2. 运行 `prompt-history --task-root ROOT`，先读工作台里同一工程用过的全部提示词；
+   查不到工程上下文时它会退回技能本地历史，工作台托管任务无法查询时不得假装已完成去重。
+3. 读真实源码，至少找到 2–3 个相关业务文件、现有数据流和一条可观察的失败后果。
+4. 读 `references/prompt-standard.md` 和 `references/difficulty-standard.md`。
+5. 运行 `prompt --init` 生成题面草稿、`difficulty-review.json` 和 `ra-renhua-review.json`；
+   初始化结果也会回传同工程历史，起草时必须先换掉重复业务问题、冲突点和改动边界。
+6. 只有难度论证能逐项回指题面原句和真实源码文件时才允许安装提示词。
 
 困难题至少满足平台三项特征中的两项，并且必须有关键设计取舍或复杂技术关注点之一；
 地狱题三项全满足，另有开放方案、隐蔽约束、架构级取舍、深水调试或跨系统恢复证据。
@@ -184,7 +187,17 @@ python3 $S config set submission.autoSubmit=true
 
    生成 `TASK_ROOT/workspace` 并提交初始快照。
 
-2. **prompt --init**：
+2. **prompt-history**：
+
+   ```bash
+   python3 $S prompt-history --task-root ROOT
+   python3 $S prompt-history --task-root ROOT --text "候选题面"
+   ```
+
+   通过本地工作台查询当前工程用过的提示词；`prompt --init` 会再次附带历史，
+   `prompt --file` 安装前会强制重查并合并技能本地历史。工作台托管任务查询失败时阻断安装。
+
+3. **prompt --init**：
 
    ```bash
    python3 $S prompt --task-root ROOT --init
@@ -193,7 +206,7 @@ python3 $S config set submission.autoSubmit=true
    生成 `delivery/题面草稿.md`、`monitor/prompt/difficulty-review.json`、
    `monitor/prompt/ra-renhua-review.json`。
 
-3. **prompt**：
+4. **prompt**：
 
    ```bash
    python3 $S prompt --task-root ROOT \
@@ -213,7 +226,7 @@ python3 $S config set submission.autoSubmit=true
    所属领域必须与 `submission.lockedDomain` 一致，任务初始化后不得通过参数改大类。
    如果找不到能真实匹配当前工程的同大类子方向，停止并换题；不要依赖表单里显示的其他领域选项。
 
-4. **repo**：
+5. **repo**：
 
    ```bash
    python3 $S repo --task-root ROOT
@@ -223,7 +236,7 @@ python3 $S config set submission.autoSubmit=true
    仓库名不再直接使用中文任务名：技能会先把常见业务词转成英文，剩余中文转拼音，再加 4 位随机后缀，
    确保名称可读且不会被 GitHub 压成 `--xxxx`。该规则只作用于后续新建仓库，不改动历史仓库。
 
-5. **run**：
+6. **run**：
 
    ```bash
    python3 $S run --task-root ROOT
@@ -239,7 +252,7 @@ python3 $S config set submission.autoSubmit=true
    回退到无头模式时运行 `run --mode print`；该模式仍只有一次机会，没有自动继续能力。
    需要手工终端流程时用 `interactive`，结束后运行 `collect`。
 
-6. **读证据并真实复核**：
+7. **读证据并真实复核**：
 
    读取：
 
@@ -251,7 +264,7 @@ python3 $S config set submission.autoSubmit=true
    只把真实执行、文件变更和客观输出写进结论。模型自述“已完成”但没有对应修改或运行证据时，
    按虚假成功处理。
 
-7. **record**：
+8. **record**：
 
    先生成并检查录屏计划。先对照题面和产物 diff 判断是否存在用户可见页面功能，再确认应用是否真能启动并
    到达页面。页面可达且存在页面功能变化时使用 `web`，填写具体的 `pageSteps`。真实启动失败且页面不可达时
@@ -302,7 +315,7 @@ python3 $S config set submission.autoSubmit=true
    Web 录屏按 [references/web-recording-runbook.md](references/web-recording-runbook.md) 一次准备、两段录制、
    一次拼接；禁止边录边试和逐项补录。详细约束见 `references/recording.md`。
 
-8. **verify → feedback**：
+9. **verify → feedback**：
 
    先造证据，再动笔。Feedback 里的每个数字、文件、报错和功能结论，机器都会拿去和真实执行记录对；
    没有对应记录的内容会被阻断，不是只给警告。
@@ -349,7 +362,7 @@ python3 $S config set submission.autoSubmit=true
    错误必须改掉；代码和数值的警告逐个判断，能换成业务说法的换掉，删了就定位不了问题的保留。
    核对结果写在 `monitor/feedback-evidence.json`，含索引摘要和逐条声明的核对状态。
 
-9. **export**：
+10. **export**：
 
    ```bash
    python3 $S export --task-root ROOT
@@ -361,7 +374,7 @@ python3 $S config set submission.autoSubmit=true
    `轨迹中有存在明文apikey暴露风险`，其他情况保持空值。
    每日汇总用 `export-batch`，会自动跳过未完成题并检查 SessionID/题面重复。
 
-10. **submit / repair**：
+11. **submit / repair**：
 
    提交平台地址、账号和认证会话只从本地工作台获取。工作台负责使用其保存的平台凭据建立新会话；
    技能不得直接读取系统 Keychain、读取认证环境变量或复用缓存 Cookie。每次提交、查询和返修都先校验
@@ -392,7 +405,7 @@ python3 $S config set submission.autoSubmit=true
    `轨迹中有存在明文apikey暴露风险` 写入 `other_issues`；否则该字段继续从 payload 中剔除，
    不沿用陈旧预览或服务端旧备注。
 
-11. **status / cleanup**：
+12. **status / cleanup**：
 
     `status` 检查十一项交付；`cleanup` 只删除本题容器，交互容器未 collect 时拒绝。
     无论最终是全部通过、真实阻断还是按要求停在导出前，结束本轮前都必须按
@@ -448,6 +461,7 @@ TASK_ROOT/
 
 ```bash
 python3 $S init --task-name NAME (--source DIR | --git URL [--ref REF]) [--tasks-dir DIR]
+python3 $S prompt-history --task-root ROOT [--text "候选题面"] [--local-only]
 python3 $S prompt --task-root ROOT --init
 python3 $S prompt --task-root ROOT --file F --task-type T --difficulty 困难|地狱 --lang "..." \
   [--domain 领域 --sub-direction 子方向 --review FILE --difficulty-review FILE --allow-over-170]

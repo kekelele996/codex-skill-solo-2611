@@ -40,6 +40,18 @@ python3 "$S" config test
 
 自动提交已按要求开启：`export` 通过后直接上传、新建提交并轮询质检，不再做本地二次确认。只有 `QC_PASSED` 才算通过。
 
+## 提示词去重
+
+工作台会为每个任务写入 `monitor/workbench.json`。设计题面前先运行：
+
+```bash
+python3 "$HOME/.codex/skills/solo-2611/scripts/solo2611.py" \
+  prompt-history --task-root ROOT
+```
+
+它按当前工程读取工作台历史，并与技能本地 `prompt-history.jsonl` 合并。`prompt --init`
+会附带同一工程的提示词清单；`prompt --file` 安装前必须再次查询，工作台托管任务无法完成查询时阻断安装。
+
 ## 最新分类
 
 | 所属领域 | 子方向 |

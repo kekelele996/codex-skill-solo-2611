@@ -25,6 +25,7 @@ import github_repo as gh  # noqa: E402
 import doctor  # noqa: E402
 import recorder  # noqa: E402
 import prompting  # noqa: E402
+import prompt_reuse  # noqa: E402
 import resume as print_resume  # noqa: E402
 import session as managed  # noqa: E402
 import submission  # noqa: E402
@@ -266,7 +267,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
 # ======================================================================= prompt
 
-def _load_history() -> list[dict[str, Any]]:
+def _local_history() -> list[dict[str, Any]]:
     if not PROMPT_HISTORY.is_file():
         return []
     rows = []
@@ -276,6 +277,105 @@ def _load_history() -> list[dict[str, Any]]:
         except json.JSONDecodeError:
             continue
     return rows
+
+
+def _merge_history(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for rows in groups:
+        for row in rows:
+            text = str(row.get("text") or "").strip()
+            if not text:
+                continue
+            key = str(row.get("sha256") or prompting.normalize(text))
+            merged[key] = {**row, "text": text} | (
+                {key_name: value for key_name, value in merged.get(key, {}).items() if value}
+                if key in merged
+                else {}
+            )
+    return list(merged.values())
+
+
+def _load_history(
+    task_root: Path,
+    *,
+    candidate_text: str = "",
+    local_only: bool = False,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    local = _local_history()
+    meta: dict[str, Any] = {
+        "ok": True,
+        "source": "local",
+        "managed": bool(prompt_reuse.read_task_marker(task_root)),
+        "required": False,
+        "error": "",
+        "status": "history",
+        "summary": {},
+    }
+    if local_only:
+        return local, meta
+    try:
+        response = prompt_reuse.query_prompt_history(
+            task_root,
+            candidate_text=candidate_text,
+            limit=500,
+        )
+    except prompt_reuse.WorkbenchPromptHistoryError as exc:
+        meta.update(
+            {
+                "ok": False,
+                "source": "local",
+                "managed": exc.managed,
+                "required": exc.managed,
+                "error": str(exc),
+                "code": exc.code,
+            }
+        )
+        return local, meta
+    remote = prompt_reuse.history_records(response)
+    meta.update(
+        {
+            "ok": True,
+            "source": "workbench+local",
+            "managed": True,
+            "required": True,
+            "projectId": str(response.get("projectId") or ""),
+            "projectName": str(response.get("projectName") or ""),
+            "engineeringId": str(response.get("engineeringId") or ""),
+            "engineeringName": str(response.get("engineeringName") or ""),
+            "status": str(response.get("status") or "history"),
+            "blocking": bool(response.get("blocking")),
+            "summary": response.get("summary") or {},
+        }
+    )
+    if int(response.get("total") or 0) > len(remote):
+        meta.update(
+            {
+                "ok": False,
+                "required": True,
+                "error": "同工程历史超过单次查询上限 500 条，拒绝在截断历史上查重",
+            }
+        )
+    return _merge_history(local, remote), meta
+
+
+def cmd_prompt_history(args: argparse.Namespace) -> None:
+    task_root = Path(args.task_root).resolve()
+    history, meta = _load_history(
+        task_root,
+        candidate_text=str(args.text or ""),
+        local_only=bool(args.local_only),
+    )
+    emit(
+        {
+            "ok": bool(meta.get("ok")) or not bool(meta.get("required")),
+            "taskRoot": str(task_root),
+            "historyMeta": meta,
+            "count": len(history),
+            "items": history,
+        }
+    )
+    if meta.get("required") and not meta.get("ok"):
+        raise SystemExit(1)
 
 
 def cmd_prompt(args: argparse.Namespace) -> None:
@@ -290,8 +390,10 @@ def cmd_prompt(args: argparse.Namespace) -> None:
                 "写成一段自然的需求说明。不要写文件路径、端口、技术栈或逐步修复指令。\n",
                 encoding="utf-8",
             )
+        history, history_meta = _load_history(task_root)
         emit({"ok": True, "draft": str(draft), "templates": templates,
-              "next": "修改题面后填写 difficulty-review.json 与 ra-renhua-review.json，再运行 prompt --file"})
+              "historyMeta": history_meta, "history": history,
+              "next": "先排除 history 中同一工程的重复题面，再填写两份审核 JSON 并运行 prompt --file"})
         return
     if state.get("attempts") and not args.force:
         raise Solo2611Error("这道题已经跑过，提示词不能再改；换题请重新 init")
@@ -348,6 +450,11 @@ def cmd_prompt(args: argparse.Namespace) -> None:
         if args.difficulty_review
         else Path(templates["difficultyReview"])
     )
+    history, history_meta = _load_history(task_root, candidate_text=text)
+    if history_meta.get("required") and not history_meta.get("ok"):
+        errors.append(
+            f"工作台提示词历史查询失败，不能在去重不完整时安装题面：{history_meta.get('error')}"
+        )
     design = prompting.validate_candidate(
         task_root=task_root,
         prompt_path=Path(args.file).resolve(),
@@ -355,7 +462,7 @@ def cmd_prompt(args: argparse.Namespace) -> None:
         difficulty=args.difficulty,
         review_path=review_path,
         difficulty_review_path=difficulty_review_path,
-        history=_load_history(),
+        history=history,
         allow_over_170=args.allow_over_170,
         domain=domain,
     )
@@ -378,6 +485,7 @@ def cmd_prompt(args: argparse.Namespace) -> None:
         "status": "prompt_ready",
     })
     save_state(task_root, state)
+    design["historyMeta"] = history_meta
     prompting.write_validation(task_root, design)
     PROMPT_HISTORY.parent.mkdir(parents=True, exist_ok=True)
     with PROMPT_HISTORY.open("a", encoding="utf-8") as fh:
@@ -1547,6 +1655,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--domain", choices=list(DOMAINS), help="必须与配置中的账号唯一大类一致")
     s.add_argument("--sub-direction", help="必须是该大类下且与真实工程匹配的子方向")
     s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("prompt-history", help="查询当前工程在工作台里用过的提示词")
+    s.add_argument("--task-root", required=True)
+    s.add_argument("--text", help="可选：同时检查一段候选题面")
+    s.add_argument("--local-only", action="store_true", help="仅读技能本地历史，不访问工作台")
+    s.set_defaults(fn=cmd_prompt_history)
 
     s = sub.add_parser("prompt", help="初始化题面证据 / 安装提示词并做规范门禁")
     s.add_argument("--task-root", required=True)
