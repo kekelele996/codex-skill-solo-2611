@@ -301,6 +301,108 @@ def test_bypass_settings_are_preaccepted_for_fresh_home(tmp_path: Path) -> None:
     assert path.stat().st_mode & 0o777 == 0o444
 
 
+def test_attempt_runtime_cleanup_removes_secret_launch_files(tmp_path: Path) -> None:
+    (tmp_path / "env.sh").write_text("export apikey=secret\n", encoding="utf-8")
+    (tmp_path / "launch.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    settings = tmp_path / "claude-managed-settings"
+    settings.mkdir()
+    (settings / "managed-settings.json").write_text("{}\n", encoding="utf-8")
+
+    session._cleanup_attempt_runtime(tmp_path)
+
+    assert not (tmp_path / "env.sh").exists()
+    assert not (tmp_path / "launch.sh").exists()
+    assert not settings.exists()
+
+
+def test_prompt_delivery_recovery_plan_is_bounded() -> None:
+    assert session._prompt_recovery_due(7.9, 0) is None
+    assert session._prompt_recovery_due(8, 0) == ("submit", 8.0)
+    assert session._prompt_recovery_due(20, 1) == ("rewrite", 20.0)
+    assert session._prompt_recovery_due(36, 2) == ("submit", 36.0)
+    assert session._prompt_recovery_due(50, 3) == ("rewrite", 50.0)
+    assert session._prompt_recovery_due(90, 4) is None
+
+
+def test_prompt_delivery_only_confirms_the_exact_trace_prompt(tmp_path: Path) -> None:
+    root = _task_root(tmp_path)
+    state = load_state(root)
+    session_state = state["sessionRun"]
+    live = root / "monitor" / "runs" / "attempt-01" / "live" / "workspace"
+    live.mkdir()
+    trace = live / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"
+    event = _event("user", "原始题面", prompt_id="p1")
+    trace.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    trace_path, prompt_event = session._matching_prompt_event(
+        root / "monitor" / "runs" / "attempt-01" / "live",
+        "原始题面",
+    )
+    assert trace_path == trace and prompt_event is not None
+
+    session._confirm_prompt_delivery(
+        root,
+        state,
+        1,
+        session_state,
+        "原始题面",
+        trace,
+        prompt_event,
+    )
+    saved = load_state(root)["sessionRun"]
+    assert saved["promptSent"] is True
+    assert saved["status"] == "prompt_sent"
+    assert saved["promptDelivery"]["status"] == "confirmed"
+    assert saved["promptDelivery"]["promptId"] == "p1"
+    assert saved["promptDelivery"]["trace"] == str(trace)
+
+
+def test_prompt_delivery_nudges_then_waits_for_trace_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _task_root(tmp_path)
+    state = load_state(root)
+    current = state["sessionRun"]
+    current["tmuxSession"] = "solo2611-test"
+    current["promptDelivery"] = {
+        "status": "waiting_trace",
+        "startedAt": "2026-11-13T08:59:50Z",
+        "literalAttempts": 1,
+        "submitAttempts": 0,
+        "history": [],
+    }
+    live = root / "monitor" / "runs" / "attempt-01" / "live"
+    trace = live / "workspace" / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("", encoding="utf-8")
+    prompt_event = _event("user", "原始题面", prompt_id="p1")
+    matches = iter([(None, None), (trace, prompt_event)])
+    submitted: list[str] = []
+
+    monkeypatch.setattr(session, "_matching_prompt_event", lambda *_: next(matches))
+    monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+    monkeypatch.setattr(session, "capture_pane", lambda *_, **__: "> ")
+    monkeypatch.setattr(session, "submit_literal_input", submitted.append)
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+
+    result = session._wait_for_initial_prompt(
+        root,
+        state,
+        current,
+        1,
+        live,
+        "原始题面",
+        timeout=5,
+    )
+
+    assert result["ok"] is True
+    assert submitted == ["solo2611-test"]
+    saved = load_state(root)["sessionRun"]
+    assert saved["promptSent"] is True
+    assert saved["promptDelivery"]["history"][0]["action"] == "submit"
+
+
 def test_docker_command_mounts_bypass_settings(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     live = tmp_path / "live"

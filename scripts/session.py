@@ -43,8 +43,24 @@ import trace as tr
 
 CONTINUE_TEXT = "继续"
 CONTINUE_HARD_LIMIT = 2
+PROMPT_DELIVERY_RECOVERY_STEPS = (
+    (8.0, "submit"),
+    (20.0, "rewrite"),
+    (36.0, "submit"),
+    (50.0, "rewrite"),
+)
+PROMPT_DELIVERY_TIMEOUT_SECONDS = 75.0
 TERMINAL = {"accepted", "aborted"}
-ACTIVE = {"launching", "prompt_sent", "running", "continuing", "holding", "manual_input", "closing"}
+ACTIVE = {
+    "launching",
+    "prompt_delivery",
+    "prompt_sent",
+    "running",
+    "continuing",
+    "holding",
+    "manual_input",
+    "closing",
+}
 RUNNING_ATTEMPT_STATUSES = {"running", "start_failed", "pending_collect"}
 REPL_READY = re.compile(r"(?m)(?:^|\n)\s*(?:>|❯|›)\s*$")
 SCREEN_BUSY = re.compile(r"(?i)esc\s+to\s+interrupt|ctrl\+c\s+to\s+interrupt")
@@ -796,6 +812,17 @@ def send_literal(name: str, text: str) -> None:
     run(["tmux", "send-keys", "-t", name, "C-m"], timeout=10)
 
 
+def submit_literal_input(name: str) -> None:
+    """Submit whatever is already in Claude Code's composer."""
+    run(["tmux", "send-keys", "-t", name, "C-m"], timeout=10)
+
+
+def rewrite_literal_input(name: str, text: str) -> None:
+    """Clear a possibly stuck composer, then send the exact same task prompt."""
+    run(["tmux", "send-keys", "-t", name, "C-u"], timeout=10)
+    send_literal(name, text)
+
+
 def send_continue(name: str) -> None:
     # The literal is intentionally a constant.  No caller-controlled text is sent.
     run(["tmux", "send-keys", "-l", "-t", name, "--", CONTINUE_TEXT], timeout=10)
@@ -816,8 +843,180 @@ def _write_bypass_settings(directory: Path) -> Path:
 
 
 def _cleanup_attempt_runtime(directory: Path) -> None:
-    _cleanup_attempt_runtime(directory)
+    for name in ATTEMPT_RUNTIME_FILES:
+        (directory / name).unlink(missing_ok=True)
     shutil.rmtree(directory / "claude-managed-settings", ignore_errors=True)
+
+
+def _prompt_recovery_due(
+    elapsed_seconds: float,
+    completed: int,
+) -> tuple[str, float] | None:
+    if completed < 0 or completed >= len(PROMPT_DELIVERY_RECOVERY_STEPS):
+        return None
+    due_at, action = PROMPT_DELIVERY_RECOVERY_STEPS[completed]
+    return (action, due_at) if elapsed_seconds >= due_at else None
+
+
+def _matching_prompt_event(
+    live: Path,
+    prompt_text: str,
+) -> tuple[Path | None, dict[str, Any] | None]:
+    expected = tr._norm(prompt_text)
+    for path in _trace_files(live):
+        reader = IncrementalTrace(path)
+        reader.read()
+        for event in reader.events:
+            if not tr.is_real_user_prompt(event):
+                continue
+            if tr._norm(tr._text_of(tr._content(event))) == expected:
+                return path, event
+    return None, None
+
+
+def _confirm_prompt_delivery(
+    task_root: Path,
+    state: dict[str, Any],
+    attempt: int,
+    session: dict[str, Any],
+    prompt_text: str,
+    trace_path: Path,
+    prompt_event: dict[str, Any],
+) -> None:
+    delivery = session.setdefault("promptDelivery", {})
+    history = delivery.get("history") or []
+    delivery.update(
+        {
+            "status": "confirmed",
+            "confirmedAt": utc_now(),
+            "trace": str(trace_path),
+            "promptId": str(prompt_event.get("promptId") or ""),
+            "repairCount": len(history),
+            "maxRepairCount": len(PROMPT_DELIVERY_RECOVERY_STEPS),
+        }
+    )
+    session["promptSent"] = True
+    session["status"] = "prompt_sent"
+    session["lastRoundStartedAt"] = delivery.get("startedAt") or utc_now()
+    session["lastActivityAt"] = utc_now()
+    _refresh_last_activity(state, progress=True)
+    save_state(task_root, state)
+    append_event(
+        task_root,
+        attempt,
+        "prompt.sent",
+        chars=len(prompt_text),
+        sha256=sha256_bytes(prompt_text.encode("utf-8")),
+        confirmed=True,
+        trace=str(trace_path),
+        promptId=delivery.get("promptId"),
+        literalAttempts=int(delivery.get("literalAttempts") or 1),
+        submitAttempts=int(delivery.get("submitAttempts") or 0),
+        repairs=len(history),
+    )
+
+
+def _wait_for_initial_prompt(
+    task_root: Path,
+    state: dict[str, Any],
+    session: dict[str, Any],
+    attempt: int,
+    live: Path,
+    prompt_text: str,
+    *,
+    timeout: float = PROMPT_DELIVERY_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    """Confirm the exact first prompt in Claude's trace, repairing a stuck send."""
+    delivery = session.setdefault("promptDelivery", {})
+    delivery.setdefault("status", "waiting_trace")
+    delivery.setdefault("startedAt", utc_now())
+    delivery.setdefault("history", [])
+    delivery.setdefault("literalAttempts", 1)
+    delivery.setdefault("submitAttempts", 0)
+    remaining = max(0.5, timeout - _elapsed_since(delivery.get("startedAt")))
+    deadline = time.monotonic() + remaining
+    while time.monotonic() < deadline:
+        trace_path, prompt_event = _matching_prompt_event(live, prompt_text)
+        if trace_path is not None and prompt_event is not None:
+            _confirm_prompt_delivery(
+                task_root,
+                state,
+                attempt,
+                session,
+                prompt_text,
+                trace_path,
+                prompt_event,
+            )
+            return {"ok": True, "reason": "confirmed", "trace": str(trace_path)}
+        if not tmux_alive(str(session.get("tmuxSession") or "")):
+            delivery["status"] = "failed"
+            delivery["error"] = "tmux_session_missing"
+            return {"ok": False, "reason": "tmux_session_missing"}
+        elapsed = _elapsed_since(delivery.get("startedAt"))
+        history = delivery.setdefault("history", [])
+        due = _prompt_recovery_due(elapsed, len(history))
+        if due is not None and history:
+            last_action_at = _parse_time(history[-1].get("at"))
+            if last_action_at is not None:
+                since_last = (
+                    datetime.now(last_action_at.tzinfo or timezone.utc) - last_action_at
+                ).total_seconds()
+                if since_last < 3:
+                    due = None
+        if due is not None:
+            action, due_at = due
+            screen = capture_pane(str(session.get("tmuxSession") or ""), lines=80)
+            if action != "rewrite" or not _screen_busy(screen):
+                if action == "submit":
+                    submit_literal_input(str(session.get("tmuxSession") or ""))
+                    delivery["submitAttempts"] = int(delivery.get("submitAttempts") or 0) + 1
+                else:
+                    rewrite_literal_input(str(session.get("tmuxSession") or ""), prompt_text)
+                    delivery["literalAttempts"] = int(delivery.get("literalAttempts") or 0) + 1
+                item = {
+                    "no": len(history) + 1,
+                    "action": action,
+                    "at": utc_now(),
+                    "dueAtSeconds": due_at,
+                    "elapsedSeconds": round(elapsed, 1),
+                    "screenBusy": _screen_busy(screen),
+                }
+                history.append(item)
+                delivery["repairCount"] = len(history)
+                delivery["maxRepairCount"] = len(PROMPT_DELIVERY_RECOVERY_STEPS)
+                delivery["lastAction"] = action
+                delivery["lastActionAt"] = item["at"]
+                save_state(task_root, state)
+                append_event(
+                    task_root,
+                    attempt,
+                    "prompt.delivery_retry",
+                    no=item["no"],
+                    action=action,
+                    dueAtSeconds=due_at,
+                    elapsedSeconds=item["elapsedSeconds"],
+                )
+        time.sleep(0.75)
+    trace_path, prompt_event = _matching_prompt_event(live, prompt_text)
+    if trace_path is not None and prompt_event is not None:
+        _confirm_prompt_delivery(
+            task_root,
+            state,
+            attempt,
+            session,
+            prompt_text,
+            trace_path,
+            prompt_event,
+        )
+        return {"ok": True, "reason": "confirmed", "trace": str(trace_path)}
+    delivery["status"] = "failed"
+    delivery["error"] = "prompt_delivery_timeout"
+    delivery.setdefault("history", [])
+    return {
+        "ok": False,
+        "reason": "prompt_delivery_timeout",
+        "repairCount": len(delivery["history"]),
+    }
 
 
 def _docker_command(
@@ -1484,10 +1683,38 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
         gateway_failures = sum(1 for item in session.get("rounds") or [] if item.get("kind") == "gateway")
         trace_reader: IncrementalTrace | None = None
         try:
-            if not prompt_sent and not _trace_files(live):
+            if not prompt_sent:
+                trace_path, prompt_event = _matching_prompt_event(live, prompt_text)
+                if trace_path is not None and prompt_event is not None:
+                    _confirm_prompt_delivery(
+                        task_root,
+                        state,
+                        attempt,
+                        session,
+                        prompt_text,
+                        trace_path,
+                        prompt_event,
+                    )
+                    prompt_sent = True
+                    append_event(task_root, attempt, "round.start", round=1)
+            if not prompt_sent and not (session.get("promptDelivery") or {}).get("startedAt"):
                 ready_info = wait_for_repl_state(str(session.get("tmuxSession") or ""), timeout=60)
                 ready = bool(ready_info.get("ok"))
-                while not ready and not prompt_sent and not _trace_files(live):
+                while not ready and not prompt_sent:
+                    trace_path, prompt_event = _matching_prompt_event(live, prompt_text)
+                    if trace_path is not None and prompt_event is not None:
+                        _confirm_prompt_delivery(
+                            task_root,
+                            state,
+                            attempt,
+                            session,
+                            prompt_text,
+                            trace_path,
+                            prompt_event,
+                        )
+                        prompt_sent = True
+                        append_event(task_root, attempt, "round.start", round=1)
+                        break
                     current_attempt = _state_attempt(state, attempt) or {}
                     current_attempt["startFailed"] = True
                     start_state = session.setdefault("startAttempts", {"used": 0, "max": 2})
@@ -1561,22 +1788,91 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     )
                     ready = bool(ready_info.get("ok"))
                 if ready and not prompt_sent:
+                    delivery = session.setdefault("promptDelivery", {})
+                    delivery.update(
+                        {
+                            "status": "waiting_trace",
+                            "startedAt": utc_now(),
+                            "confirmedAt": "",
+                            "trace": "",
+                            "promptId": "",
+                            "literalAttempts": 1,
+                            "submitAttempts": 0,
+                            "repairCount": 0,
+                            "maxRepairCount": len(PROMPT_DELIVERY_RECOVERY_STEPS),
+                            "history": [],
+                            "error": "",
+                        }
+                    )
+                    session["status"] = "prompt_delivery"
+                    session["lastRoundStartedAt"] = delivery["startedAt"]
+                    save_state(task_root, state)
                     send_literal(str(session.get("tmuxSession") or ""), prompt_text)
-                    prompt_sent = True
-                    session["promptSent"] = True
-                    session["status"] = "prompt_sent"
-                    session["lastRoundStartedAt"] = utc_now()
                     _refresh_last_activity(state, progress=True)
                     append_event(
                         task_root,
                         attempt,
-                        "prompt.sent",
+                        "prompt.dispatch",
                         chars=len(prompt_text),
                         sha256=sha256_bytes(prompt_text.encode("utf-8")),
+                        attemptNo=1,
                     )
-                    append_event(task_root, attempt, "round.start", round=1)
                     _cleanup_attempt_runtime(directory)
                     save_state(task_root, state)
+            if not prompt_sent:
+                delivered = _wait_for_initial_prompt(
+                    task_root,
+                    state,
+                    session,
+                    attempt,
+                    live,
+                    prompt_text,
+                )
+                if not delivered.get("ok"):
+                    delivery = session.setdefault("promptDelivery", {})
+                    reason = str(delivered.get("reason") or "prompt_delivery_failed")
+                    screen_log = directory / "prompt-delivery-screen.log"
+                    screen_log.write_text(
+                        capture_pane(str(session.get("tmuxSession") or ""), lines=200),
+                        encoding="utf-8",
+                    )
+                    delivery["status"] = "failed"
+                    delivery["error"] = reason
+                    session["status"] = "start_failed"
+                    session["error"] = (
+                        f"题面连续 {len(PROMPT_DELIVERY_RECOVERY_STEPS)} 次自动补发仍未写入 Claude Code 轨迹"
+                    )
+                    session["blocked"] = None
+                    session["nextActionAt"] = None
+                    current_attempt = _state_attempt(state, attempt) or {}
+                    current_attempt["status"] = "start_failed"
+                    current_attempt["startFailed"] = True
+                    current_attempt["finishedAt"] = utc_now()
+                    current_attempt["errors"] = list(current_attempt.get("errors") or []) + [
+                        session["error"]
+                    ]
+                    state["status"] = "prompt_ready"
+                    copied: Path | None = None
+                    with suppress(OSError):
+                        copied = _copy_live_to_traces(task_root, attempt)
+                    _remove_tmux_and_container(
+                        str(session.get("container") or ""),
+                        str(session.get("tmuxSession") or ""),
+                    )
+                    _cleanup_attempt_runtime(directory)
+                    save_state(task_root, state)
+                    append_event(
+                        task_root,
+                        attempt,
+                        "prompt.delivery_failed",
+                        reason=reason,
+                        repairs=len(delivery.get("history") or []),
+                        screen=str(screen_log),
+                        traces=str(copied or ""),
+                    )
+                    return
+                prompt_sent = True
+                append_event(task_root, attempt, "round.start", round=1)
             while True:
                 state = load_state(task_root)
                 session = state.get("sessionRun") or {}
@@ -1780,6 +2076,13 @@ def resume_session(task_root: Path) -> dict[str, Any]:
         return {"ok": True, "status": "accepted", "supervised": False}
     if status == "aborted":
         return {"ok": True, "status": "aborted", "supervised": False}
+    if status == "start_failed":
+        return {
+            "ok": False,
+            "status": "start_failed",
+            "supervised": False,
+            "message": "启动失败发生在会话成立前；请由调度器重新排队，不直接接回旧监督器",
+        }
     if supervisor_alive(state, task_root):
         return {"ok": True, "status": status or "running", "supervised": False, "message": "监督器已在线"}
     attempt = int(session.get("attemptIndex") or 0)
@@ -1832,6 +2135,7 @@ def status_view(task_root: Path, *, log_lines: int = 20) -> dict[str, Any]:
     state_value = str(session.get("status") or state.get("status") or "unknown")
     session_state = {
         "launching": "running",
+        "prompt_delivery": "running",
         "prompt_sent": "running",
         "running": "running",
         "continuing": "waiting_continue",
@@ -1848,6 +2152,27 @@ def status_view(task_root: Path, *, log_lines: int = 20) -> dict[str, Any]:
         last_kind = str(rounds[-1].get("kind") or "")
     if not last_kind and session.get("interrupts"):
         last_kind = str(session["interrupts"][-1].get("kind") or "")
+    delivery = session.get("promptDelivery") or {}
+    prompt_delivery = (
+        {
+            "status": str(delivery.get("status") or ""),
+            "startedAt": str(delivery.get("startedAt") or ""),
+            "confirmedAt": str(delivery.get("confirmedAt") or ""),
+            "trace": str(delivery.get("trace") or ""),
+            "promptId": str(delivery.get("promptId") or ""),
+            "literalAttempts": int(delivery.get("literalAttempts") or 0),
+            "submitAttempts": int(delivery.get("submitAttempts") or 0),
+            "repairCount": int(delivery.get("repairCount") or len(delivery.get("history") or [])),
+            "maxRepairCount": int(
+                delivery.get("maxRepairCount") or len(PROMPT_DELIVERY_RECOVERY_STEPS)
+            ),
+            "lastAction": str(delivery.get("lastAction") or ""),
+            "lastActionAt": str(delivery.get("lastActionAt") or ""),
+            "error": str(delivery.get("error") or ""),
+        }
+        if delivery
+        else None
+    )
     return {
         "status": state_value,
         "startedAt": session.get("startedAt") or "",
@@ -1871,6 +2196,8 @@ def status_view(task_root: Path, *, log_lines: int = 20) -> dict[str, Any]:
         "sessionId": (state.get("session") or {}).get("sessionId") or "",
         "promptId": (state.get("session") or {}).get("promptId") or "",
         "blocked": blocked or None,
+        "promptDelivery": prompt_delivery,
+        "error": str(session.get("error") or ""),
         "abort": session.get("abort"),
         "outcome": session.get("outcome"),
         "logTail": tail_log(supervisor_log(task_root, attempt), log_lines),
