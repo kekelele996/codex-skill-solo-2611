@@ -287,11 +287,7 @@ def _merge_history(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if not text:
                 continue
             key = str(row.get("sha256") or prompting.normalize(text))
-            merged[key] = {**row, "text": text} | (
-                {key_name: value for key_name, value in merged.get(key, {}).items() if value}
-                if key in merged
-                else {}
-            )
+            merged[key] = {**merged.get(key, {}), **row, "text": text}
     return list(merged.values())
 
 
@@ -301,7 +297,10 @@ def _load_history(
     candidate_text: str = "",
     local_only: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    local = _local_history()
+    local = [
+        {**row, "source": str(row.get("source") or "local")}
+        for row in _local_history()
+    ]
     meta: dict[str, Any] = {
         "ok": True,
         "source": "local",
@@ -365,13 +364,16 @@ def cmd_prompt_history(args: argparse.Namespace) -> None:
         candidate_text=str(args.text or ""),
         local_only=bool(args.local_only),
     )
+    engineering_history = [item for item in history if item.get("source") == "workbench"]
+    output_items = engineering_history or history
     emit(
         {
             "ok": bool(meta.get("ok")) or not bool(meta.get("required")),
             "taskRoot": str(task_root),
             "historyMeta": meta,
-            "count": len(history),
-            "items": history,
+            "count": len(output_items),
+            "localHistoryCount": len(history) - len(engineering_history),
+            "items": output_items,
         }
     )
     if meta.get("required") and not meta.get("ok"):
@@ -391,8 +393,11 @@ def cmd_prompt(args: argparse.Namespace) -> None:
                 encoding="utf-8",
             )
         history, history_meta = _load_history(task_root)
+        engineering_history = [item for item in history if item.get("source") == "workbench"]
         emit({"ok": True, "draft": str(draft), "templates": templates,
-              "historyMeta": history_meta, "history": history,
+              "historyMeta": history_meta,
+              "history": engineering_history or history,
+              "localHistoryCount": len(history) - len(engineering_history),
               "next": "先排除 history 中同一工程的重复题面，再填写两份审核 JSON 并运行 prompt --file"})
         return
     if state.get("attempts") and not args.force:

@@ -119,6 +119,7 @@ def history_records(response: dict[str, Any]) -> list[dict[str, Any]]:
                 "similarity": float(item.get("ratio") or 0),
                 "commonFragment": str(item.get("commonFragment") or ""),
                 "level": str(item.get("level") or "history"),
+                "source": "workbench",
             }
         )
     return records
