@@ -904,3 +904,142 @@ def test_doctor_baseline_is_read_only(tmp_path: Path) -> None:
     assert result["attempts"] == 1
     assert result["attemptStatus"]["running"] == 1
     assert (root / "monitor" / "state.json").read_bytes() == before
+
+
+def test_repl_ready_waits_for_a_stable_screen_before_sending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 输入框一闪而过，随后才弹出确认页：不能在第一眼看到输入框时就判定就绪。
+    keys = _fake_tmux(
+        monkeypatch,
+        ["❯ ", "Bypass Permissions mode\n  No, exit\n❯ Yes, I accept", "❯ ", "❯ "],
+    )
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert result["prompts"] == ["bypass"]
+    assert keys == ["C-m"]
+
+
+def _delivery_root(tmp_path: Path) -> tuple[Path, dict, dict, Path]:
+    root = _task_root(tmp_path)
+    state = load_state(root)
+    current = state["sessionRun"]
+    current["tmuxSession"] = "solo2611-test"
+    current["promptDelivery"] = {
+        "status": "waiting_trace",
+        "startedAt": session.utc_now(),
+        "literalAttempts": 1,
+        "submitAttempts": 0,
+        "history": [],
+    }
+    return root, state, current, root / "monitor" / "runs" / "attempt-01" / "live"
+
+
+def test_prompt_delivery_answers_startup_page_then_resends_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, state, current, live = _delivery_root(tmp_path)
+    trace = live / "workspace" / "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl"
+    trace.parent.mkdir(parents=True)
+    trace.write_text("", encoding="utf-8")
+    resent: list[str] = []
+    screens = iter(["Bypass Permissions mode\n  No, exit\n❯ Yes, I accept"])
+    keys: list[str] = []
+
+    def matching(*_: object) -> tuple:
+        return (trace, _event("user", "原始题面", prompt_id="p1")) if resent else (None, None)
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        keys.append(command[-1])
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(session, "_matching_prompt_event", matching)
+    monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+    monkeypatch.setattr(session, "capture_pane", lambda *_, **__: next(screens, "❯ "))
+    monkeypatch.setattr(session, "rewrite_literal_input", lambda name, text: resent.append(text))
+    monkeypatch.setattr(session, "run", fake_run)
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+
+    result = session._wait_for_initial_prompt(root, state, current, 1, live, "原始题面", timeout=5)
+
+    assert result["ok"] is True
+    # 确认页只收到确认键，题面在输入框就绪后整段重发一次。
+    assert keys == ["C-m"]
+    assert resent == ["原始题面"]
+    saved = load_state(root)["sessionRun"]["promptDelivery"]
+    assert saved["startupPageAttempts"] == 1
+    assert saved["startupResends"] == 1
+    assert saved["history"] == []
+    events = session.supervisor_log(root, 1).read_text(encoding="utf-8")
+    assert "prompt.startup_page" in events and "prompt.startup_resend" in events
+
+
+def test_prompt_delivery_restarts_claude_once_in_a_fresh_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, state, current, live = _delivery_root(tmp_path)
+    directory = live.parent
+    (live / "stale.jsonl").write_text("{}\n", encoding="utf-8")
+    removed: list[tuple[str, str]] = []
+    sent: list[tuple[str, str]] = []
+
+    def fake_launch(**_: object) -> dict[str, str]:
+        (directory / "live").mkdir(exist_ok=True)
+        return {"container": "solo2611-test-new", "tmux": "tmux-new", "env": "", "launch": ""}
+
+    monkeypatch.setattr(session, "capture_pane", lambda *_, **__: "Bypass Permissions mode")
+    monkeypatch.setattr(session, "_remove_tmux_and_container", lambda *args: removed.append(args))
+    monkeypatch.setattr(session, "launch_tmux_container", fake_launch)
+    monkeypatch.setattr(session, "maybe_open_session_terminal", lambda *_: {})
+    monkeypatch.setattr(session, "wait_for_repl_state", lambda *_, **__: {"ok": True, "reason": "ready"})
+    monkeypatch.setattr(session.capacity, "settle", lambda: None)
+    monkeypatch.setattr(session, "send_literal", lambda name, text: sent.append((name, text)))
+    monkeypatch.setattr(session, "load_config", lambda: {"claude": {"launchSpacingSeconds": 5}})
+    monkeypatch.setattr(session.time, "sleep", lambda _: None)
+
+    outcome = session._restart_for_prompt_delivery(
+        root, state, current, 1, directory, "原始题面", "prompt_delivery_timeout"
+    )
+
+    assert outcome == "sent"
+    assert removed == [("solo2611-test", "solo2611-test")]
+    assert sent == [("tmux-new", "原始题面")]
+    assert (directory / "live-prompt-restart-1" / "stale.jsonl").exists()
+    assert not (directory / "live" / "stale.jsonl").exists()
+    saved = load_state(root)["sessionRun"]
+    assert saved["container"] == "solo2611-test-new"
+    assert saved["status"] == "prompt_delivery"
+    assert saved["promptRestarts"]["used"] == 1
+    assert saved["promptDelivery"]["restartNo"] == 1
+    assert saved["promptDelivery"]["history"] == []
+    # 只换一次容器；再失败就按原来的启动失败收尾。
+    again = session._restart_for_prompt_delivery(
+        root, state, current, 1, directory, "原始题面", "prompt_delivery_timeout"
+    )
+    assert again == "exhausted"
+    assert len(sent) == 1
+
+
+def test_prompt_delivery_restart_stops_when_task_was_aborted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, state, current, live = _delivery_root(tmp_path)
+    launched: list[object] = []
+
+    def aborted_meanwhile(_seconds: float) -> None:
+        latest = load_state(root)
+        latest["sessionRun"]["status"] = "aborted"
+        save_state(root, latest)
+
+    monkeypatch.setattr(session, "capture_pane", lambda *_, **__: "")
+    monkeypatch.setattr(session, "_remove_tmux_and_container", lambda *_: None)
+    monkeypatch.setattr(session, "launch_tmux_container", lambda **kw: launched.append(kw))
+    monkeypatch.setattr(session, "load_config", lambda: {"claude": {}})
+    monkeypatch.setattr(session.time, "sleep", aborted_meanwhile)
+
+    assert session._restart_for_prompt_delivery(root, state, current, 1, live.parent, "题面", "x") == "terminal"
+    assert launched == []

@@ -52,6 +52,14 @@ PROMPT_DELIVERY_RECOVERY_STEPS = (
     (50.0, "rewrite"),
 )
 PROMPT_DELIVERY_TIMEOUT_SECONDS = 75.0
+# 题面送达确认中途若又出现启动确认页：先确认，再在输入框就绪后重发题面；
+# 重发后至少再给这么多秒等轨迹落盘。
+PROMPT_STARTUP_RESEND_GRACE_SECONDS = 30.0
+PROMPT_STARTUP_MAX_RESENDS = 3
+# 补发全部失败后，换一个新容器重新拉起 Claude Code 再发一次题面的次数。
+PROMPT_DELIVERY_MAX_RESTARTS = 1
+REPL_STABLE_CAPTURES = 2
+REPL_STABLE_INTERVAL_SECONDS = 1.0
 TERMINAL = {"accepted", "aborted"}
 ACTIVE = {
     "launching",
@@ -949,6 +957,7 @@ def wait_for_repl_state(
     prompts: list[str] = []
     screen = ""
     missing = 0
+    ready_streak = 0
 
     def result(ok: bool, reason: str) -> dict[str, Any]:
         return {
@@ -972,6 +981,7 @@ def wait_for_repl_state(
         screen = current
         kind = _startup_prompt(screen)
         if kind:
+            ready_streak = 0
             now = time.monotonic()
             if confirmation_started is None:
                 confirmation_started = now
@@ -984,8 +994,17 @@ def wait_for_repl_state(
             time.sleep(0.8)
             continue
         if REPL_READY.search(screen) and not _screen_busy(screen):
-            return result(True, "ready")
+            # 输入框第一次出现时，确认页可能还在后面排队弹出；连续两次（间隔约 1 秒）
+            # 都是输入框且没有确认页，才算真正就绪，避免题面落进随后弹出的确认页。
+            ready_streak += 1
+            if ready_streak >= REPL_STABLE_CAPTURES:
+                return result(True, "ready")
+            time.sleep(REPL_STABLE_INTERVAL_SECONDS)
+            continue
+        ready_streak = 0
         time.sleep(0.5)
+    if ready_streak:
+        return result(True, "ready")
     return result(False, "repl_timeout")
 
 
@@ -1148,9 +1167,58 @@ def _wait_for_initial_prompt(
             delivery["status"] = "failed"
             delivery["error"] = "tmux_session_missing"
             return {"ok": False, "reason": "tmux_session_missing"}
+        tmux_name = str(session.get("tmuxSession") or "")
+        screen = capture_pane(tmux_name, lines=80)
+        page = _startup_prompt(screen)
+        if page:
+            # 题面发出时 Claude Code 还停在确认页：按键被确认页吃掉，题面没进输入框。
+            # 这里只处理确认页，绝不把题面文字当回车发给确认页。
+            tries = int(delivery.get("startupPageAttempts") or 0)
+            strategy = _accept_bypass_prompt(tmux_name, screen, tries)
+            delivery["startupPageAttempts"] = tries + 1
+            delivery["startupPagePending"] = True
+            save_state(task_root, state)
+            append_event(
+                task_root,
+                attempt,
+                "prompt.startup_page",
+                kind=page,
+                strategy=strategy,
+                no=tries + 1,
+            )
+            time.sleep(0.8)
+            continue
+        if (
+            delivery.get("startupPagePending")
+            and REPL_READY.search(screen)
+            and not _screen_busy(screen)
+        ):
+            delivery["startupPagePending"] = False
+            resends = int(delivery.get("startupResends") or 0)
+            if resends < PROMPT_STARTUP_MAX_RESENDS:
+                rewrite_literal_input(tmux_name, prompt_text)
+                delivery["startupResends"] = resends + 1
+                delivery["literalAttempts"] = int(delivery.get("literalAttempts") or 0) + 1
+                delivery["startupResendAt"] = utc_now()
+                deadline = max(deadline, time.monotonic() + PROMPT_STARTUP_RESEND_GRACE_SECONDS)
+                save_state(task_root, state)
+                append_event(
+                    task_root,
+                    attempt,
+                    "prompt.startup_resend",
+                    no=resends + 1,
+                    chars=len(prompt_text),
+                )
+                time.sleep(0.75)
+                continue
         elapsed = _elapsed_since(delivery.get("startedAt"))
         history = delivery.setdefault("history", [])
         due = _prompt_recovery_due(elapsed, len(history))
+        resend_at = _parse_time(delivery.get("startupResendAt"))
+        if due is not None and resend_at is not None:
+            since_resend = (datetime.now(resend_at.tzinfo or timezone.utc) - resend_at).total_seconds()
+            if since_resend < 5:
+                due = None
         if due is not None and history:
             last_action_at = _parse_time(history[-1].get("at"))
             if last_action_at is not None:
@@ -1161,7 +1229,6 @@ def _wait_for_initial_prompt(
                     due = None
         if due is not None:
             action, due_at = due
-            screen = capture_pane(str(session.get("tmuxSession") or ""), lines=80)
             if action != "rewrite" or not _screen_busy(screen):
                 if action == "submit":
                     submit_literal_input(str(session.get("tmuxSession") or ""))
@@ -1213,6 +1280,128 @@ def _wait_for_initial_prompt(
         "reason": "prompt_delivery_timeout",
         "repairCount": len(delivery["history"]),
     }
+
+
+def _fresh_prompt_delivery() -> dict[str, Any]:
+    return {
+        "status": "waiting_trace",
+        "startedAt": utc_now(),
+        "confirmedAt": "",
+        "trace": "",
+        "promptId": "",
+        "literalAttempts": 1,
+        "submitAttempts": 0,
+        "repairCount": 0,
+        "maxRepairCount": len(PROMPT_DELIVERY_RECOVERY_STEPS),
+        "history": [],
+        "error": "",
+    }
+
+
+def _restart_for_prompt_delivery(
+    task_root: Path,
+    state: dict[str, Any],
+    session: dict[str, Any],
+    attempt: int,
+    directory: Path,
+    prompt_text: str,
+    reason: str,
+) -> str:
+    """Last-resort fallback: relaunch Claude Code in a fresh container and resend.
+
+    Returns ``sent`` when the prompt was sent again (the caller re-confirms it),
+    ``terminal`` when the task was aborted meanwhile, and ``exhausted`` when no
+    restart is left or the new session never reached the input box.
+    """
+    restarts = session.setdefault("promptRestarts", {"used": 0, "max": PROMPT_DELIVERY_MAX_RESTARTS})
+    used = int(restarts.get("used") or 0)
+    if used >= int(restarts.get("max") or PROMPT_DELIVERY_MAX_RESTARTS):
+        return "exhausted"
+    restarts["used"] = used + 1
+    tmux_name = str(session.get("tmuxSession") or "")
+    screen_log = directory / f"prompt-delivery-screen-restart-{used + 1}.log"
+    with suppress(OSError):
+        screen_log.write_text(capture_pane(tmux_name, lines=200), encoding="utf-8")
+    previous = dict(session.get("promptDelivery") or {})
+    append_event(
+        task_root,
+        attempt,
+        "prompt.delivery_restart",
+        no=used + 1,
+        reason=reason,
+        repairs=len(previous.get("history") or []),
+        startupPages=int(previous.get("startupPageAttempts") or 0),
+        screen=str(screen_log),
+    )
+    _remove_tmux_and_container(str(session.get("container") or ""), tmux_name)
+    _cleanup_attempt_runtime(directory)
+    # 旧容器的轨迹目录挪走，新会话写进干净的 live，避免后续取证读到两段会话。
+    live = directory / "live"
+    if live.exists():
+        with suppress(OSError):
+            live.rename(directory / f"live-prompt-restart-{used + 1}")
+    session["status"] = "launching"
+    session["promptDelivery"] = {**_fresh_prompt_delivery(), "status": "restarting", "startedAt": ""}
+    save_state(task_root, state)
+    config = load_config()
+    claude = config.get("claude") or {}
+    time.sleep(max(5, int(claude.get("launchSpacingSeconds") or 20)))
+    if _terminal(load_state(task_root)):
+        return "terminal"
+    key = os.environ.get("SOLO2611_API_KEY", "").strip() or str(claude.get("apiKey") or "").strip()
+    url = os.environ.get("SOLO2611_BASE_URL", "").strip() or str(claude.get("baseUrl") or "").strip()
+    try:
+        launched = launch_tmux_container(
+            task_root=task_root,
+            state=state,
+            attempt=attempt,
+            image=str(claude.get("image") or ""),
+            key=key,
+            base_url=url,
+        )
+    except Exception as exc:  # noqa: BLE001 - 兜底失败时按原来的启动失败收尾
+        append_event(task_root, attempt, "prompt.delivery_restart_failed", error=f"{type(exc).__name__}: {exc}")
+        _cleanup_attempt_runtime(directory)
+        return "exhausted"
+    session["container"] = launched["container"]
+    session["tmuxSession"] = launched["tmux"]
+    session["visibleTerminal"] = maybe_open_session_terminal(task_root, attempt, launched["tmux"])
+    current_attempt = _state_attempt(state, attempt) or {}
+    current_attempt["container"] = launched["container"]
+    save_state(task_root, state)
+    repl_timeout, confirm_timeout = _repl_timeouts()
+    ready_info = wait_for_repl_state(launched["tmux"], timeout=repl_timeout, confirmation_timeout=confirm_timeout)
+    capacity.settle()
+    if not ready_info.get("ok"):
+        append_event(
+            task_root,
+            attempt,
+            "prompt.delivery_restart_failed",
+            reason=ready_info.get("reason"),
+            strategies=ready_info.get("strategies"),
+        )
+        _cleanup_attempt_runtime(directory)
+        return "exhausted"
+    delivery = _fresh_prompt_delivery()
+    delivery["restartNo"] = used + 1
+    session["promptDelivery"] = delivery
+    session["status"] = "prompt_delivery"
+    session["lastRoundStartedAt"] = delivery["startedAt"]
+    save_state(task_root, state)
+    send_literal(launched["tmux"], prompt_text)
+    _refresh_last_activity(state, progress=True)
+    append_event(
+        task_root,
+        attempt,
+        "prompt.dispatch",
+        chars=len(prompt_text),
+        sha256=sha256_bytes(prompt_text.encode("utf-8")),
+        attemptNo=used + 2,
+        restart=used + 1,
+    )
+    _cleanup_attempt_runtime(directory)
+    save_state(task_root, state)
+    return "sent"
 
 
 def _docker_command(
@@ -2056,21 +2245,7 @@ def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> 
                     ready = bool(ready_info.get("ok"))
                 if ready and not prompt_sent:
                     delivery = session.setdefault("promptDelivery", {})
-                    delivery.update(
-                        {
-                            "status": "waiting_trace",
-                            "startedAt": utc_now(),
-                            "confirmedAt": "",
-                            "trace": "",
-                            "promptId": "",
-                            "literalAttempts": 1,
-                            "submitAttempts": 0,
-                            "repairCount": 0,
-                            "maxRepairCount": len(PROMPT_DELIVERY_RECOVERY_STEPS),
-                            "history": [],
-                            "error": "",
-                        }
-                    )
+                    delivery.update(_fresh_prompt_delivery())
                     session["status"] = "prompt_delivery"
                     session["lastRoundStartedAt"] = delivery["startedAt"]
                     save_state(task_root, state)
@@ -2096,6 +2271,27 @@ def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> 
                     prompt_text,
                 )
                 if not delivered.get("ok"):
+                    restarted = _restart_for_prompt_delivery(
+                        task_root,
+                        state,
+                        session,
+                        attempt,
+                        directory,
+                        prompt_text,
+                        str(delivered.get("reason") or "prompt_delivery_failed"),
+                    )
+                    if restarted == "terminal":
+                        return
+                    if restarted == "sent":
+                        delivered = _wait_for_initial_prompt(
+                            task_root,
+                            state,
+                            session,
+                            attempt,
+                            live,
+                            prompt_text,
+                        )
+                if not delivered.get("ok"):
                     delivery = session.setdefault("promptDelivery", {})
                     reason = str(delivered.get("reason") or "prompt_delivery_failed")
                     screen_log = directory / "prompt-delivery-screen.log"
@@ -2106,8 +2302,10 @@ def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> 
                     delivery["status"] = "failed"
                     delivery["error"] = reason
                     session["status"] = "start_failed"
+                    restarts = int((session.get("promptRestarts") or {}).get("used") or 0)
                     session["error"] = (
                         f"题面连续 {len(PROMPT_DELIVERY_RECOVERY_STEPS)} 次自动补发仍未写入 Claude Code 轨迹"
+                        + (f"，换新容器重启 {restarts} 次后仍然如此" if restarts else "")
                     )
                     session["blocked"] = None
                     session["nextActionAt"] = None
