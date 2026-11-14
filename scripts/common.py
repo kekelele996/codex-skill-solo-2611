@@ -44,9 +44,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "launchSpacingSeconds": 20,
         "runMode": "supervised",
         "continueMax": 2,
-        "startAttempts": 2,
+        "startAttempts": 3,
+        "replTimeoutSeconds": 90,
+        "slotWaitSeconds": 1800,
         "fatalHoldMinutes": 30,
         "openTerminalOnRun": False,
+        "terminalReadOnly": True,
+        "terminalActivate": False,
     },
     "tasksDir": str(DEFAULT_TASKS_DIR),
     "git": {"userName": "solo-2611", "userEmail": "solo-2611@local"},
@@ -63,6 +67,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "lockedDomain": "",
         "pollIntervalSeconds": 300,
         "pollTimeoutSeconds": 86400,
+        "localReviewScoreDelta": 2,
+        "localReviewMinSimilarity": 0.5,
     },
 }
 
@@ -149,7 +155,8 @@ def load_config() -> dict[str, Any]:
         config["configVersion"] = 4
     claude = config.setdefault("claude", {})
     claude["continueMax"] = min(2, max(0, int(claude.get("continueMax") or 0)))
-    claude["startAttempts"] = min(2, max(1, int(claude.get("startAttempts") or 2)))
+    claude["startAttempts"] = min(3, max(1, int(claude.get("startAttempts") or 3)))
+    claude["replTimeoutSeconds"] = min(600, max(30, int(claude.get("replTimeoutSeconds") or 90)))
     claude["launchSpacingSeconds"] = max(5, int(claude.get("launchSpacingSeconds") or 20))
     claude["silentSeconds"] = max(60, int(claude.get("silentSeconds") or 1200))
     claude["noProgressSeconds"] = max(60, int(claude.get("noProgressSeconds") or 1200))

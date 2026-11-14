@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 TMP = Path(tempfile.mkdtemp(prefix="solo2611-test-"))
-os.environ["CODEX_HOME"] = str(TMP / "codex")
-os.environ["SOLO2611_CONFIG"] = str(TMP / "codex" / "solo-2611" / "config.json")
+os.environ.setdefault("CODEX_HOME", str(TMP / "codex"))
+os.environ.setdefault("SOLO2611_CONFIG", str(TMP / "codex" / "solo-2611" / "config.json"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import excel  # noqa: E402
@@ -423,7 +423,17 @@ def test_submission_remark_only_for_plaintext_api_key_risk(
         "_probe_video",
         lambda _path: {"width": 1280, "height": 720, "duration": 1.0, "size": 5},
     )
-    monkeypatch.setattr(submission.fb, "check", lambda _path: {"ok": True, "errors": [], "warnings": []})
+    monkeypatch.setattr(
+        submission.fb,
+        "check",
+        lambda _path, **_kwargs: {
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "score": row["交付完整性"],
+            "feedback": row["Feedback"],
+        },
+    )
 
     prepared = submission.preflight(root, server=client.server, locked_domain="数据工程")
     preview = json.loads((root / "monitor" / "submission" / "payload-preview.json").read_text(encoding="utf-8"))

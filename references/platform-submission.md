@@ -119,6 +119,16 @@ python3 scripts/solo2611.py repair --task-root ROOT \
   --execute --watch
 ```
 
+7. 返修前的核对（预览和正式提交都会执行）：
+   - 评分和 Feedback 重新做轨迹证据核对，并与交付表逐项比对；任何一项不通过都拒绝提交。
+   - 与平台上已提交的评分和 Feedback 比较（平台详情没有带回原值时，使用首次提交时保存的
+     `submitted-feedback.json`）。交付完整性相差不少于 `submission.localReviewScoreDelta`
+     （默认 2），或正文相似度低于 `submission.localReviewMinSimilarity`（默认 0.5），返回
+     `local_review_required`，退出码 4，不调用 `PUT`。
+   - 待核验内容写在 `local-review.json`：出入原因、质检原文、修改前后的评分和正文。专家
+     对照轨迹核验后用 `local-review --approve --reviewer 姓名` 登记，再重新执行 `repair`。
+     结论与内容指纹绑定，内容再变则重新进入待核验。
+
 视频本身需要更新时加 `--refresh-video`。返修只能调用原提交 ID 的 `PUT`，不能创建新记录，
 也不能改写锁定字段。`other_issues` 仅在当前轨迹重新命中明文 API Key 风险时写入固定备注，
 否则必须从返修 payload 中省略。
@@ -132,4 +142,6 @@ monitor/submission/api-result.json
 monitor/submission/qc-history.json
 monitor/submission/fix-request.json
 monitor/submission/repair-payload.json
+monitor/submission/submitted-feedback.json
+monitor/submission/local-review.json
 ```

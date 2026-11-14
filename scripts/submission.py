@@ -1,6 +1,7 @@
 """SOLO2 submission for one completed solo-2611 task."""
 from __future__ import annotations
 
+import difflib
 import hashlib
 import json
 import mimetypes
@@ -193,6 +194,164 @@ class ApiClient:
             "path": str(value.get("path")),
             "size": int(value.get("size") or path.stat().st_size),
         }
+
+
+LOCAL_REVIEW_SCORE_DELTA = 2
+LOCAL_REVIEW_MIN_SIMILARITY = 0.5
+SCORE_LABEL = "交付完整性"
+FEEDBACK_LABEL = "Feedback"
+
+
+def local_review_path(task_root: Path) -> Path:
+    return task_root / "monitor" / "submission" / "local-review.json"
+
+
+def submitted_feedback_path(task_root: Path) -> Path:
+    return task_root / "monitor" / "submission" / "submitted-feedback.json"
+
+
+def _compact(text: Any) -> str:
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _score(value: Any) -> int | None:
+    match = re.fullmatch(r"([1-5])(?:\.0+)?", str(value if value is not None else "").strip())
+    return int(match.group(1)) if match else None
+
+
+def _opinion_fingerprint(score: Any, feedback: Any) -> str:
+    return hashlib.sha256(f"{_score(score)}\n{_compact(feedback)}".encode("utf-8")).hexdigest()
+
+
+def _remember_submitted_opinion(task_root: Path, submission_id: Any) -> None:
+    """首次提交时留一份评分和 Feedback，平台详情取不到原值时用它做返修比对的基准。"""
+    path = submitted_feedback_path(task_root)
+    if path.is_file():
+        return
+    try:
+        row = _read_delivery_row(task_root)
+    except Solo2611Error:
+        return
+    write_json(
+        path,
+        {
+            "submissionId": submission_id,
+            "score": _score(row.get(SCORE_LABEL)),
+            "feedback": str(row.get(FEEDBACK_LABEL) or ""),
+            "savedAt": utc_now(),
+        },
+        mode=0o600,
+    )
+
+
+def _trace_backed_opinion(task_root: Path, state: dict[str, Any], row: dict[str, Any]) -> dict[str, Any]:
+    """返修要提交的评分和 Feedback 必须仍能在轨迹与产物里回查到，并且和交付表一致。"""
+    checked = fb.check(task_root / "delivery" / "feedback.md", task_root=task_root, state=state)
+    if not checked.get("ok"):
+        raise Solo2611Error(
+            "返修后的 Feedback 与轨迹证据不一致，禁止提交："
+            + "；".join(str(item) for item in checked.get("errors") or [])
+        )
+    stale = []
+    if "score" in checked and _score(checked["score"]) != _score(row.get(SCORE_LABEL)):
+        stale.append(SCORE_LABEL)
+    if "feedback" in checked and _compact(checked["feedback"]) != _compact(row.get(FEEDBACK_LABEL)):
+        stale.append(FEEDBACK_LABEL)
+    if stale:
+        raise Solo2611Error(
+            f"交付表里的{'、'.join(stale)}与 delivery/feedback.md 不一致，"
+            "先运行 export --no-submit 重新生成交付表"
+        )
+    return checked
+
+
+def _opinion_drift(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    score_delta: int,
+    min_similarity: float,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    old_score, new_score = _score(before.get("score")), _score(after.get("score"))
+    if old_score is not None and new_score is not None and abs(new_score - old_score) >= max(1, score_delta):
+        reasons.append(f"交付完整性从 {old_score} 分改为 {new_score} 分，相差 {abs(new_score - old_score)} 分")
+    old_text, new_text = _compact(before.get("feedback")), _compact(after.get("feedback"))
+    similarity = None
+    if old_text and new_text:
+        similarity = round(difflib.SequenceMatcher(None, old_text, new_text, autojunk=False).ratio(), 3)
+        if similarity < min_similarity:
+            reasons.append(f"Feedback 正文与已提交版本的相似度只有 {similarity}，低于 {min_similarity}")
+    return {
+        "reasons": reasons,
+        "similarity": similarity,
+        "scoreBefore": old_score,
+        "scoreAfter": new_score,
+        "comparable": bool(old_text and new_text) or (old_score is not None and new_score is not None),
+    }
+
+
+def _local_review_gate(
+    task_root: Path,
+    submission_id: Any,
+    *,
+    before: dict[str, Any],
+    after: dict[str, Any],
+    baseline: str,
+    qc_summary: Any,
+    score_delta: int,
+    min_similarity: float,
+) -> dict[str, Any]:
+    """返修意见和已提交、基于轨迹得出的意见出入较大时，停下来等本地核验。"""
+    drift = _opinion_drift(before, after, score_delta=score_delta, min_similarity=min_similarity)
+    fingerprint = _opinion_fingerprint(after.get("score"), after.get("feedback"))
+    summary = {**drift, "baseline": baseline, "fingerprint": fingerprint, "required": bool(drift["reasons"])}
+    if not drift["reasons"]:
+        return {**summary, "status": "not_required"}
+    path = local_review_path(task_root)
+    record = _safe_json(path)
+    same = str(record.get("submissionId")) == str(submission_id) and record.get("fingerprint") == fingerprint
+    if same and record.get("status") == "approved":
+        return {**summary, "status": "approved", "reviewer": record.get("reviewer"), "review": str(path)}
+    if not (same and record.get("status") in {"pending", "rejected"}):
+        record = {
+            "status": "pending",
+            "submissionId": submission_id,
+            "fingerprint": fingerprint,
+            "reasons": drift["reasons"],
+            "similarity": drift["similarity"],
+            "baseline": baseline,
+            "qcSummary": qc_summary,
+            "before": {"score": drift["scoreBefore"], "feedback": str(before.get("feedback") or "")},
+            "after": {"score": drift["scoreAfter"], "feedback": str(after.get("feedback") or "")},
+            "createdAt": utc_now(),
+        }
+        write_json(path, record, mode=0o600)
+    return {**summary, "status": str(record.get("status")), "review": str(path)}
+
+
+def local_review(
+    task_root: Path,
+    *,
+    decision: str = "",
+    reviewer: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    """查看或登记本地核验结论。结论只对当时核验的那一版评分和 Feedback 有效。"""
+    path = local_review_path(task_root)
+    record = _safe_json(path)
+    if not record:
+        return {"ok": True, "status": "not_required", "review": str(path)}
+    if decision:
+        if decision not in {"approved", "rejected"}:
+            raise Solo2611Error(f"未知的核验结论: {decision}")
+        if not reviewer.strip():
+            raise Solo2611Error("登记本地核验结论必须提供 --reviewer")
+        record.update(
+            {"status": decision, "reviewer": reviewer.strip(), "note": note.strip(), "reviewedAt": utc_now()}
+        )
+        write_json(path, record, mode=0o600)
+    return {"ok": record.get("status") == "approved", "review": str(path), **record}
 
 
 def _safe_json(path: Path) -> dict[str, Any]:
@@ -631,6 +790,8 @@ def submit_task(
         "submittedAt": utc_now(),
     }
     _save_result(task_root, result)
+    if submission_id is not None:
+        _remember_submitted_opinion(task_root, submission_id)
     if not watch:
         return result
     if submission_id is None:
@@ -706,6 +867,8 @@ def repair_task(
     poll_interval: float = 300,
     poll_timeout: float = 86400,
     locked_domain: str = "",
+    review_score_delta: int = LOCAL_REVIEW_SCORE_DELTA,
+    review_min_similarity: float = LOCAL_REVIEW_MIN_SIMILARITY,
 ) -> dict[str, Any]:
     if not comment.strip():
         raise Solo2611Error("返修必须提供 --comment")
@@ -718,9 +881,11 @@ def repair_task(
     state = load_state(task_root)
     submission_remark = tr.submission_remark(state, api_key_remark=trace_api_key_risk["remark"])
     row = _read_delivery_row(task_root)
+    _trace_backed_opinion(task_root, state, row)
     schema = client.request("GET", "/api/v1/submissions/form-schema")
     current = detail.get("data") if isinstance(detail.get("data"), dict) else detail
     data: dict[str, Any] = {}
+    opinion_keys: dict[str, str] = {}
     locked = {str(item) for item in detail.get("locked_fields") or []}
     if submission_remark and not any(
         item.get("is_enabled", True) and _is_remark_field(item)
@@ -734,6 +899,8 @@ def repair_task(
             continue
         key = str(field.get("field_key") or "")
         label = str(field.get("label") or "")
+        if label in {SCORE_LABEL, FEEDBACK_LABEL}:
+            opinion_keys[label] = key
         if _is_remark_field(field):
             data[key] = submission_remark
         elif key == "trace_file":
@@ -758,6 +925,29 @@ def repair_task(
         uploaded = client.upload(files["screencast"], "video")
         data["screencast"] = uploaded["url"]
     data = _sanitize_submission_data(data, include_remark=bool(submission_remark))
+    before = {
+        "score": current.get(opinion_keys.get(SCORE_LABEL, "")),
+        "feedback": current.get(opinion_keys.get(FEEDBACK_LABEL, "")),
+    }
+    baseline = "platform"
+    if _score(before["score"]) is None and not _compact(before["feedback"]):
+        # 平台详情没有带回原值时，退回到首次提交时留下的那一份。
+        remembered = _safe_json(submitted_feedback_path(task_root))
+        before = {"score": remembered.get("score"), "feedback": remembered.get("feedback")}
+        baseline = "submitted-snapshot" if remembered else "unavailable"
+    review = _local_review_gate(
+        task_root,
+        submission_id,
+        before=before,
+        after={
+            "score": data.get(opinion_keys.get(SCORE_LABEL, "")),
+            "feedback": data.get(opinion_keys.get(FEEDBACK_LABEL, "")),
+        },
+        baseline=baseline,
+        qc_summary=detail.get("qc_summary"),
+        score_delta=review_score_delta,
+        min_similarity=review_min_similarity,
+    )
     preview = {
         "submissionId": submission_id,
         "schemaFingerprint": fingerprint,
@@ -768,6 +958,19 @@ def repair_task(
         "comment": comment,
     }
     write_json(task_root / "monitor" / "submission" / "repair-payload.json", preview, mode=0o600)
+    if review["required"] and review["status"] != "approved":
+        held = {
+            "ok": False,
+            "status": "local_review_required",
+            "submissionId": submission_id,
+            "localReviewRequired": True,
+            "localReview": review,
+            "statusLabel": "返修意见与已提交意见出入较大，等待本地核验",
+            "qcSummary": detail.get("qc_summary"),
+            "preview": str(task_root / "monitor" / "submission" / "repair-payload.json"),
+        }
+        _save_result(task_root, held)
+        return held
     if not execute:
         return {"ok": True, "status": "repair_dry_run", "submissionId": submission_id, "preview": str(task_root / "monitor" / "submission" / "repair-payload.json")}
     response = client.request(
@@ -776,7 +979,13 @@ def repair_task(
         payload=preview,
         timeout=180,
     )
-    result = {"ok": True, "status": "fix_submitted", "submissionId": submission_id, "response": response}
+    result = {
+        "ok": True,
+        "status": "fix_submitted",
+        "submissionId": submission_id,
+        "response": response,
+        "localReview": review,
+    }
     _save_result(task_root, result)
     if watch:
         watched = poll_submission(

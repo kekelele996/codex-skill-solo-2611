@@ -39,6 +39,8 @@ from common import (
     utc_now,
     write_json,
 )
+import capacity
+import terminal_view
 import trace as tr
 
 CONTINUE_TEXT = "继续"
@@ -70,6 +72,13 @@ BYPASS_EXIT = "No, exit"
 BYPASS_OPTION = re.compile(
     r"(?m)^\s*(?:❯|›|>|➜|→|●|○|◉|◯|\*)\s*(No, exit|Yes, I accept)\s*$"
 )
+# 启动阶段可能出现的确认页：Bypass Permissions、信任文件夹等。统一按“选项行”解析。
+STARTUP_OPTION = re.compile(
+    r"(?m)^[ \t│|]*(?P<mark>❯|›|>|➜|→|●|◉|\*)?[ \t]*(?:○|◯)?[ \t]*"
+    r"(?:(?P<num>\d+)[.)][ \t]*)?(?P<text>(?:Yes|No)\b[^\n│|]*?)[ \t│|]*$"
+)
+STARTUP_CONFIRM_HINT = re.compile(r"(?i)enter to confirm|esc to cancel|do you trust|trust the files")
+STARTUP_CONTINUE_HINT = re.compile(r"(?i)press enter to continue")
 ATTEMPT_RUNTIME_FILES = ("env.sh", "launch.sh")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
@@ -109,7 +118,11 @@ def assert_interactive_prereqs() -> None:
 
 
 def open_session_terminal(tmux_name: str) -> dict[str, Any]:
-    """Open a visible Terminal window attached to the managed tmux session."""
+    """Open a visible Terminal window attached to the managed tmux session.
+
+    The window never takes keyboard focus and attaches read-only by default,
+    so keys typed elsewhere cannot land in the managed session.
+    """
     if sys.platform != "darwin":
         return {
             "requested": True,
@@ -123,34 +136,18 @@ def open_session_terminal(tmux_name: str) -> dict[str, Any]:
                 "opened": False,
                 "error": f"tmux 会话不存在: {tmux_name}",
             }
-        command = f"tmux attach-session -t {shlex.quote(tmux_name)}"
-        escaped = command.replace("\\", "\\\\").replace('"', '\\"')
-        script = (
-            'tell application "Terminal"\n'
-            "  activate\n"
-            f'  do script "{escaped}"\n'
-            "end tell"
+        claude = load_config().get("claude") or {}
+        return terminal_view.open_window(
+            tmux_name,
+            read_only=claude.get("terminalReadOnly", True) is not False,
+            activate=claude.get("terminalActivate", False) is True,
         )
-        result = run(["osascript", "-e", script], check=False, timeout=15)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except Exception as exc:  # noqa: BLE001 - 可见窗口只是辅助，任何失败都不能影响会话
         return {
             "requested": True,
             "opened": False,
             "error": f"打开 Terminal.app 失败: {exc}",
         }
-    if result.returncode != 0:
-        error = result.stderr.decode("utf-8", errors="replace").strip()
-        return {
-            "requested": True,
-            "opened": False,
-            "error": error[-500:] or "打开 Terminal.app 失败",
-        }
-    return {
-        "requested": True,
-        "opened": True,
-        "app": "Terminal",
-        "tmux": tmux_name,
-    }
 
 
 def maybe_open_session_terminal(
@@ -169,9 +166,51 @@ def maybe_open_session_terminal(
         "terminal.visible_open",
         opened=result.get("opened") is True,
         app=result.get("app"),
+        tmux=tmux_name,
+        windowId=result.get("windowId"),
         error=result.get("error"),
     )
     return result
+
+
+def close_session_terminal(
+    tmux_name: str,
+    *,
+    task_root: Path | None = None,
+    attempt: int | None = None,
+) -> dict[str, Any]:
+    """Close the visible window of a finished tmux session; never raises."""
+    if not tmux_name or sys.platform != "darwin":
+        return {"closed": 0, "skipped": 0}
+    try:
+        result = terminal_view.close_window(tmux_name, alive=tmux_alive)
+    except Exception as exc:  # noqa: BLE001
+        result = {"closed": 0, "skipped": 0, "error": str(exc)[-300:]}
+    if task_root is not None and attempt is not None and (
+        result.get("closed") or result.get("skipped") or result.get("error")
+    ):
+        with suppress(Exception):
+            append_event(
+                task_root,
+                attempt,
+                "terminal.visible_close",
+                tmux=tmux_name,
+                closed=result.get("closed"),
+                skipped=result.get("skipped"),
+                reason=result.get("reason"),
+                error=result.get("error"),
+            )
+    return result
+
+
+def sweep_session_terminals() -> dict[str, Any]:
+    """Close every leftover window whose managed tmux session is gone; never raises."""
+    if sys.platform != "darwin":
+        return {"closed": 0, "kept": 0, "sessions": []}
+    try:
+        return terminal_view.sweep(tmux_alive)
+    except Exception as exc:  # noqa: BLE001
+        return {"closed": 0, "kept": 0, "sessions": [], "error": str(exc)[-300:]}
 
 
 def _parse_time(value: Any) -> datetime | None:
@@ -785,80 +824,160 @@ def _bypass_selection(screen: str) -> str:
     return match.group(1) if match else ""
 
 
+def _startup_options(screen: str) -> list[dict[str, Any]]:
+    """Option rows of a startup confirmation page, in screen order."""
+    options: list[dict[str, Any]] = []
+    for match in STARTUP_OPTION.finditer(screen or ""):
+        text = match.group("text").strip()
+        options.append(
+            {
+                "text": text,
+                "selected": bool(match.group("mark")),
+                "accept": text.lower().startswith("yes"),
+            }
+        )
+    return options
+
+
+def _startup_prompt(screen: str) -> str:
+    """Kind of confirmation page on screen: bypass / confirm / continue / ''."""
+    if BYPASS_WARNING in screen and BYPASS_ACCEPT in screen:
+        return "bypass"
+    options = _startup_options(screen)
+    if (
+        STARTUP_CONFIRM_HINT.search(screen or "")
+        and any(item["accept"] for item in options)
+        and any(not item["accept"] for item in options)
+    ):
+        return "confirm"
+    if STARTUP_CONTINUE_HINT.search(screen or ""):
+        return "continue"
+    return ""
+
+
+def _selection_offset(screen: str) -> int | None:
+    """Rows from the highlighted option to the first accepting one; None if unknown."""
+    options = _startup_options(screen)
+    target = next((i for i, item in enumerate(options) if item["accept"]), None)
+    current = next((i for i, item in enumerate(options) if item["selected"]), None)
+    if target is None or current is None:
+        return None
+    return target - current
+
+
+def _send_key(name: str, key: str) -> None:
+    run(["tmux", "send-keys", "-t", name, key], check=False, timeout=10)
+
+
 def _accept_bypass_prompt(name: str, screen: str, attempt: int) -> str:
-    """Choose Yes with several terminal encodings; return the strategy used."""
-    selection = _bypass_selection(screen)
-    confirm_key = "C-m" if attempt == 0 else "Enter"
-    if selection == BYPASS_EXIT:
-        run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
-        time.sleep(0.2)
-        run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
-        return "selected-no-then-down-enter"
-    if selection == BYPASS_ACCEPT:
-        run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
+    """Move the highlight onto the accepting option, verify it, then confirm.
+
+    Enter is only sent after the screen shows the accepting option selected:
+    sending Down and Enter back to back can confirm ``No, exit`` when both keys
+    reach Claude Code in one batch.  Returns the strategy used.
+    """
+    confirm_key = "C-m" if attempt % 2 == 0 else "Enter"
+    if _startup_prompt(screen) == "continue":
+        _send_key(name, confirm_key)
+        return "continue-enter"
+    offset = _selection_offset(screen)
+    if offset == 0:
+        _send_key(name, confirm_key)
         return "selected-yes-enter"
-    if attempt == 0:
-        run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
-        time.sleep(0.25)
-        refreshed = capture_pane(name, lines=30)
-        if _bypass_selection(refreshed) == BYPASS_ACCEPT:
-            run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
-            return "down-detected-yes-enter"
+    if offset is None:
+        # 高亮标记没认出来（终端换行或字符集差异）。先只移动光标，下一轮再读屏；
+        # 多次仍认不出时才盲按，盲按前留足间隔，避免两个键被合并处理。
+        _send_key(name, "Down")
+        if attempt >= 5 and attempt % 3 == 2:
+            time.sleep(1.0)
+            _send_key(name, confirm_key)
+            return "blind-down-enter"
         return "down-sent-await-selection"
-    run(["tmux", "send-keys", "-t", name, "Down"], check=False, timeout=10)
-    run(["tmux", "send-keys", "-t", name, confirm_key], check=False, timeout=10)
-    return "blind-down-enter"
+    key = "Down" if offset > 0 else "Up"
+    for _ in range(abs(offset)):
+        _send_key(name, key)
+        time.sleep(0.15)
+    for _ in range(8):
+        time.sleep(0.25)
+        refreshed = capture_pane(name, lines=40)
+        if not _startup_prompt(refreshed):
+            return "moved-prompt-gone"
+        if _selection_offset(refreshed) == 0:
+            _send_key(name, confirm_key)
+            return "selected-no-then-down-enter"
+    return "moved-unverified"
 
 
 def wait_for_repl_state(
     name: str,
     *,
-    timeout: float = 60,
-    confirmation_timeout: float = 12,
+    timeout: float = 90,
+    confirmation_timeout: float = 45,
 ) -> dict[str, Any]:
+    """Wait for the Claude Code input box, answering startup confirmation pages.
+
+    Keeps answering for the whole confirmation window instead of giving up
+    after a fixed number of key presses, and returns at once when the tmux
+    session has exited (for example after the container died).
+    """
     deadline = time.monotonic() + max(1, timeout)
     confirmation_started: float | None = None
     confirmation_attempts = 0
     strategies: list[str] = []
+    prompts: list[str] = []
     screen = ""
+    missing = 0
+
+    def result(ok: bool, reason: str) -> dict[str, Any]:
+        return {
+            "ok": ok,
+            "reason": reason,
+            "confirmationAttempts": confirmation_attempts,
+            "strategies": strategies[-20:],
+            "prompts": prompts,
+            "screen": screen[-4000:],
+        }
+
     while time.monotonic() < deadline:
-        screen = capture_pane(name, lines=40)
-        if BYPASS_WARNING in screen and BYPASS_ACCEPT in screen:
+        current = capture_pane(name, lines=40)
+        if not current.strip() and not tmux_alive(name):
+            missing += 1
+            if missing >= 2:
+                return result(False, "session_exited")
+            time.sleep(0.5)
+            continue
+        missing = 0
+        screen = current
+        kind = _startup_prompt(screen)
+        if kind:
             now = time.monotonic()
             if confirmation_started is None:
                 confirmation_started = now
-            if confirmation_attempts < 3:
-                strategies.append(_accept_bypass_prompt(name, screen, confirmation_attempts))
-                confirmation_attempts += 1
-                time.sleep(0.8)
-                continue
+            if kind not in prompts:
+                prompts.append(kind)
             if now - confirmation_started >= confirmation_timeout:
-                return {
-                    "ok": False,
-                    "reason": "confirmation_timeout",
-                    "confirmationAttempts": confirmation_attempts,
-                    "strategies": strategies,
-                    "screen": screen[-4000:],
-                }
-        elif REPL_READY.search(screen) and not _screen_busy(screen):
-            return {
-                "ok": True,
-                "reason": "ready",
-                "confirmationAttempts": confirmation_attempts,
-                "strategies": strategies,
-                "screen": screen[-4000:],
-            }
+                return result(False, "confirmation_timeout")
+            strategies.append(_accept_bypass_prompt(name, screen, confirmation_attempts))
+            confirmation_attempts += 1
+            time.sleep(0.8)
+            continue
+        if REPL_READY.search(screen) and not _screen_busy(screen):
+            return result(True, "ready")
         time.sleep(0.5)
-    return {
-        "ok": False,
-        "reason": "repl_timeout",
-        "confirmationAttempts": confirmation_attempts,
-        "strategies": strategies,
-        "screen": screen[-4000:],
-    }
+    return result(False, "repl_timeout")
 
 
-def wait_for_repl(name: str, *, timeout: float = 60) -> bool:
+def _repl_timeouts() -> tuple[float, float]:
+    claude = load_config().get("claude") or {}
+    try:
+        total = float(claude.get("replTimeoutSeconds") or 90)
+    except (TypeError, ValueError):
+        total = 90.0
+    total = min(600.0, max(30.0, total))
+    return total, min(total, max(15.0, total / 2))
+
+
+def wait_for_repl(name: str, *, timeout: float = 90) -> bool:
     return bool(wait_for_repl_state(name, timeout=timeout).get("ok"))
 
 
@@ -1132,6 +1251,17 @@ def launch_tmux_container(
     settings_dir = _write_bypass_settings(directory)
     name = _container_name(str(state["taskName"]), attempt)
     tmux_name = _tmux_name(str(state["taskName"]), attempt)
+    # 所有受管启动（首次运行、启动失败后的重启）都从这里过容量闸门；
+    # run 命令已提前占位时这里只是续期并登记容器名。
+    claude = load_config().get("claude") or {}
+    holder = capacity.holder_key(task_root)
+    capacity.acquire(
+        holder,
+        limit=int(claude.get("maxContainers") or 4),
+        container=name,
+        task_root=task_root,
+        wait_seconds=float(claude.get("slotWaitSeconds") or capacity.DEFAULT_WAIT_SECONDS),
+    )
     env_path = directory / "env.sh"
     launch_path = directory / "launch.sh"
     _write_private(
@@ -1154,14 +1284,32 @@ def launch_tmux_container(
         f"source {shlex.quote(str(env_path))}\n"
         "exec " + " ".join(shlex.quote(part) for part in command) + "\n",
     )
-    result = run(
-        ["tmux", "new-session", "-d", "-s", tmux_name, "-c", str(workspace), str(launch_path)],
-        check=False,
-        timeout=30,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(out(result) or result.stderr.decode(errors="replace"))
-    return {"container": name, "tmux": tmux_name, "env": str(env_path), "launch": str(launch_path)}
+    error = ""
+    for number in range(3):
+        try:
+            result = run(
+                ["tmux", "new-session", "-d", "-s", tmux_name, "-c", str(workspace), str(launch_path)],
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        else:
+            if result.returncode == 0:
+                return {
+                    "container": name,
+                    "tmux": tmux_name,
+                    "env": str(env_path),
+                    "launch": str(launch_path),
+                }
+            error = out(result) or result.stderr.decode(errors="replace")
+        # tmux 服务刚启动或上一个同名会话还没回收时会偶发失败，清掉残留后重试。
+        with suppress(Exception):
+            _remove_tmux_and_container(name, tmux_name)
+        if number < 2:
+            time.sleep(2 * (number + 1))
+    capacity.release(holder)
+    raise RuntimeError(f"tmux 会话连续 3 次创建失败: {error.strip()[-500:]}")
 
 
 def _remove_tmux_and_container(name: str, tmux_name: str) -> None:
@@ -1169,6 +1317,8 @@ def _remove_tmux_and_container(name: str, tmux_name: str) -> None:
         run(["tmux", "kill-session", "-t", tmux_name], check=False, timeout=10)
     if name and container_exists(name):
         run(["docker", "rm", "-f", name], check=False, timeout=60)
+    capacity.release_container(name)
+    close_session_terminal(tmux_name)
 
 
 def _state_attempt(state: dict[str, Any], index: int) -> dict[str, Any] | None:
@@ -1229,7 +1379,7 @@ def prepare_attempt(task_root: Path, state: dict[str, Any], image: str) -> dict[
         "blocked": None,
         "abort": None,
         "outcome": None,
-        "startAttempts": {"used": 0, "max": int((config.get("claude") or {}).get("startAttempts") or 2)},
+        "startAttempts": {"used": 0, "max": int((config.get("claude") or {}).get("startAttempts") or 3)},
     }
     append_event(task_root, index, "session.start", mode="supervised", attemptNo=index, maxContinues=max_continue)
     return attempt
@@ -1283,6 +1433,9 @@ def start_supervised(
     base_url = os.environ.get("SOLO2611_BASE_URL", "").strip() or str(claude.get("baseUrl") or "").strip()
     if not key:
         raise Solo2611Error("缺少本期团队 API Key")
+    if claude.get("openTerminalOnRun"):
+        # 先收回以前会话留下的窗口，避免越开越多。
+        sweep_session_terminals()
     attempt = _state_attempt(state, attempt_index)
     if attempt is None:
         raise Solo2611Error(f"找不到 attempt {attempt_index}")
@@ -1453,8 +1606,10 @@ def abort(task_root: Path, reason: str, *, by: str = "auto", detail: str = "") -
     if container and container_exists(container):
         run(["docker", "stop", "-t", "10", container], check=False, timeout=30)
         run(["docker", "rm", container], check=False, timeout=60)
+    capacity.release_container(container)
     if tmux_name and tmux_alive(tmux_name):
         run(["tmux", "kill-session", "-t", tmux_name], check=False, timeout=10)
+    close_session_terminal(tmux_name, task_root=task_root, attempt=attempt)
     directory = attempt_dir(task_root, attempt)
     buffer = directory / "tmux.buffer.log"
     buffer.write_text(screen, encoding="utf-8")
@@ -1576,6 +1731,7 @@ def _close_and_accept(task_root: Path, attempt_index: int) -> dict[str, Any]:
             deadline = time.monotonic() + 15
             while time.monotonic() < deadline and container_running(container):
                 time.sleep(0.5)
+    close_session_terminal(tmux_name, task_root=task_root, attempt=attempt_index)
     copied = _copy_live_to_traces(task_root, attempt_index)
     import solo2611 as cli
 
@@ -1712,6 +1868,19 @@ def _wait_seconds(kind: str, classification: dict[str, Any]) -> float:
 
 
 def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> None:
+    """Run the supervisor, then always take back the visible Terminal windows."""
+    try:
+        _supervisor_loop(task_root, attempt, attach=attach)
+    finally:
+        with suppress(Exception):
+            session = load_state(task_root).get("sessionRun") or {}
+            tmux_name = str(session.get("tmuxSession") or "")
+            if tmux_name and not tmux_alive(tmux_name):
+                close_session_terminal(tmux_name, task_root=task_root, attempt=attempt)
+            sweep_session_terminals()
+
+
+def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> None:
     lock_path = task_root / "monitor" / ".supervisor.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with lock_path.open("a+") as lock:
@@ -1764,7 +1933,13 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     prompt_sent = True
                     append_event(task_root, attempt, "round.start", round=1)
             if not prompt_sent and not (session.get("promptDelivery") or {}).get("startedAt"):
-                ready_info = wait_for_repl_state(str(session.get("tmuxSession") or ""), timeout=60)
+                repl_timeout, confirm_timeout = _repl_timeouts()
+                ready_info = wait_for_repl_state(
+                    str(session.get("tmuxSession") or ""),
+                    timeout=repl_timeout,
+                    confirmation_timeout=confirm_timeout,
+                )
+                capacity.settle()
                 ready = bool(ready_info.get("ok"))
                 while not ready and not prompt_sent:
                     trace_path, prompt_event = _matching_prompt_event(live, prompt_text)
@@ -1783,9 +1958,9 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                         break
                     current_attempt = _state_attempt(state, attempt) or {}
                     current_attempt["startFailed"] = True
-                    start_state = session.setdefault("startAttempts", {"used": 0, "max": 2})
+                    start_state = session.setdefault("startAttempts", {"used": 0, "max": 3})
                     used = int(start_state.get("used") or 0)
-                    maximum = min(2, max(1, int(start_state.get("max") or 2)))
+                    maximum = min(3, max(1, int(start_state.get("max") or 3)))
                     screen_log = directory / "startup-screen.log"
                     screen_log.write_text(str(ready_info.get("screen") or ""), encoding="utf-8")
                     append_event(
@@ -1810,6 +1985,8 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                         session["error"] = (
                             "Claude Code 首次权限确认未通过，已自动尝试多种确认键并重启，仍无法进入输入框"
                             if reason == "confirmation_timeout"
+                            else "Claude Code 容器启动后立即退出，重启后仍然如此，请检查镜像、API Key 和 Docker 状态"
+                            if reason == "session_exited"
                             else "启动失败次数已用尽"
                         )
                         current_attempt["status"] = "start_failed"
@@ -1824,7 +2001,7 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     save_state(task_root, state)
                     config = load_config()
                     spacing = max(5, int((config.get("claude") or {}).get("launchSpacingSeconds") or 20))
-                    time.sleep(spacing)
+                    time.sleep(5 if ready_info.get("reason") == "session_exited" else spacing)
                     config = load_config()
                     claude = config.get("claude") or {}
                     key = os.environ.get("SOLO2611_API_KEY", "").strip() or str(claude.get("apiKey") or "").strip()
@@ -1850,8 +2027,10 @@ def supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> N
                     save_state(task_root, state)
                     ready_info = wait_for_repl_state(
                         str(session.get("tmuxSession") or ""),
-                        timeout=60,
+                        timeout=repl_timeout,
+                        confirmation_timeout=confirm_timeout,
                     )
+                    capacity.settle()
                     ready = bool(ready_info.get("ok"))
                 if ready and not prompt_sent:
                     delivery = session.setdefault("promptDelivery", {})

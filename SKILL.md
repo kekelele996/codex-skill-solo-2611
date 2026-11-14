@@ -184,6 +184,7 @@ python3 $S config test
 python3 $S config show
 python3 $S config set submission.autoSubmit=true
 python3 $S config set claude.openTerminalOnRun=true   # 首次启动受管会话时自动打开可见 Terminal
+python3 $S terminal-sweep                             # 关闭已结束会话残留的可见终端窗口
 ```
 
 配置文件为 `~/.codex/solo-2611/config.json`（0600）。`SOLO2611_API_KEY`、`SOLO2611_BASE_URL`
@@ -266,9 +267,15 @@ python3 $S config set claude.openTerminalOnRun=true   # 首次启动受管会话
    调用方断开不影响监督器与容器。用 `run-status --json` 查看进度，用 `resume` 接回。
    受管模式前置要求 `tmux >= 3.0` 且宿主机不是 Windows；不满足时显式阻断，可切回 print。
    `claude.openTerminalOnRun=true` 时，新会话会另开一个可见的 macOS Terminal 窗口并接入 tmux；
-   关闭终端窗口只退出查看，不停止任务。默认 `false`，避免无人值守和录屏时弹窗。
+   窗口不抢键盘焦点，默认只读接入（`claude.terminalReadOnly=false` 可改为可输入），
+   关闭终端窗口只退出查看，不停止任务。会话结束、放弃、启动失败或重启换会话时，技能会自动关闭
+   对应窗口；启动新会话前和 `cleanup` 时还会清扫已结束会话残留的窗口，也可随时手动执行
+   `terminal-sweep`。仍在运行的会话和用户自己的终端窗口不会被关闭。默认 `false`，避免无人值守和录屏时弹窗。
    新机器首次进入 REPL 时，技能通过只读 managed settings 预接受镜像既定的 Bypass Permissions 模式；
-   若未来版本仍显示确认页，会在 12 秒内尝试多种选择键，超时即重启并记录屏幕快照，不能一直卡在确认页。
+   若仍显示确认页（Bypass Permissions、信任文件夹等），技能先移动光标并回读屏幕，确认高亮停在
+   `Yes` 选项后才回车，在确认时限内持续重试；容器已退出时立即识别，不再干等。等待输入框的总时长由
+   `claude.replTimeoutSeconds` 控制（默认 90 秒），超时即重启并记录屏幕快照，最多启动 3 次，
+   tmux 会话创建失败也会自动重试 3 次，不能一直卡在确认页。
    总时长默认 10800 秒，无进展或静默默认 1200 秒；退出开机会话后导出完整 Claude projects 目录，
    校验题面、继续次数、最终轮次、SessionID 和 PromptID，再打产物快照、生成轨迹时间线并推送。
 
@@ -423,6 +430,25 @@ python3 $S config set claude.openTerminalOnRun=true   # 首次启动受管会话
      --comment "按质检要求补充证据" --execute --watch [--refresh-video]
    ```
 
+   返修不是照着质检意见改口。`repair` 在提交前做两项核对：
+
+   - 返修后的评分和 Feedback 必须重新通过轨迹证据核对，并且与交付表一致；不通过直接拒绝提交。
+   - 把返修后的评分和 Feedback 与平台上已提交的版本比较。交付完整性相差 2 分及以上，或正文
+     相似度低于 0.5，说明质检意见与依据轨迹得出的意见出入较大：命令不提交，写入
+     `monitor/submission/local-review.json`，状态为 `local_review_required`，退出码 4。
+
+   出现 `local_review_required` 时必须停下来等待标注专家本地核验，Agent 不得自行登记核验结论，
+   也不得为了避开阈值而拆分修改或改写措辞。专家对照轨迹核验后登记结论，再重新执行 `repair`：
+
+   ```bash
+   python3 $S local-review --task-root ROOT                       # 查看待核验内容
+   python3 $S local-review --task-root ROOT --approve --reviewer 姓名 [--note 说明]
+   python3 $S local-review --task-root ROOT --reject  --reviewer 姓名 [--note 说明]
+   ```
+
+   核验结论只对当时核验的那一版评分和 Feedback 有效，之后再改内容需要重新核验。阈值由
+   `submission.localReviewScoreDelta`、`submission.localReviewMinSimilarity` 配置。
+
    `QC_PASSED` 时才结束平台流程；返修始终更新原记录，不能另建重复记录。
    新建和返修会重新扫描当前主会话轨迹。只有命中明文 API Key 风险时，才把固定备注
    `轨迹中有存在明文apikey暴露风险` 写入 `other_issues`；否则该字段继续从 payload 中剔除，
@@ -520,6 +546,8 @@ python3 $S feedback --task-root ROOT --init|--check
 python3 $S submit --task-root ROOT [--dry-run|--execute] [--watch]
 python3 $S submission-status --task-root ROOT --submission-id ID
 python3 $S repair --task-root ROOT --submission-id ID --comment TEXT [--execute] [--watch]
+python3 $S local-review --task-root ROOT [--approve|--reject --reviewer NAME] [--note TEXT]
+python3 $S capacity                               # 容器名额：上限、运行中、启动中
 python3 $S export --task-root ROOT [--allow-incomplete]
 python3 $S export-batch [--tasks-dir DIR] [--date YYYY-MM-DD] [--out FILE]
 python3 $S cleanup --task-root ROOT [--force]

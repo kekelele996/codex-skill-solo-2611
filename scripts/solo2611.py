@@ -27,6 +27,7 @@ import recorder  # noqa: E402
 import prompting  # noqa: E402
 import prompt_reuse  # noqa: E402
 import resume as print_resume  # noqa: E402
+import capacity  # noqa: E402
 import session as managed  # noqa: E402
 import submission  # noqa: E402
 import trace as tr  # noqa: E402
@@ -56,7 +57,7 @@ COPY_IGNORE = shutil.ignore_patterns("node_modules", ".git", "dist", "build", ".
                                      "__pycache__", ".venv", "venv", "target", ".DS_Store", "coverage")
 SECRET_NAMES = (".env", "id_rsa", "id_ed25519", "credentials.json")
 PROMPT_HISTORY = STATE_HOME / "prompt-history.jsonl"
-CONTAINER_LOCK = STATE_HOME / "containers.lock"
+CONTAINER_LOCK = capacity.CONTAINER_LOCK
 LAUNCH_LOCK = STATE_HOME / "launch.lock"
 
 
@@ -604,6 +605,7 @@ def _collect_container(task_root: Path, state: dict[str, Any], name: str, attemp
     if proc.returncode != 0:
         raise Solo2611Error(f"导出轨迹失败，容器 {name} 已保留，不要删除：{proc.stderr.decode(errors='replace')}")
     removed = run(["docker", "rm", name], check=False, timeout=60)
+    capacity.release_container(name)
     if removed.returncode != 0:
         inspect = run(["docker", "inspect", name], check=False, timeout=20)
         if inspect.returncode == 0:
@@ -683,12 +685,21 @@ def cmd_run(args: argparse.Namespace) -> None:
         managed.assert_interactive_prereqs()
         ws = ws_of(state)
         os.chmod(ws, 0o777)
+        # 先占容器名额再开始计时：等名额的时间不算进会话总时限，也不消耗会话机会。
+        holder = capacity.holder_key(task_root)
+        capacity.acquire(
+            holder,
+            limit=int(config_get(config, "claude.maxContainers") or 4),
+            task_root=task_root,
+            wait_seconds=float(config_get(config, "claude.slotWaitSeconds") or capacity.DEFAULT_WAIT_SECONDS),
+        )
         attempt = managed.prepare_attempt(task_root, state, image)
         save_state(task_root, state)
         _wait_launch_spacing(config)
         try:
             result = managed.start_supervised(task_root, load_state(task_root), int(attempt["index"]))
         except Exception as exc:
+            capacity.release(holder)
             failed_state = load_state(task_root)
             failed_run = failed_state.setdefault("sessionRun", {})
             failed_run["status"] = "start_failed"
@@ -759,21 +770,25 @@ def cmd_run(args: argparse.Namespace) -> None:
     }
     save_state(task_root, state)
     cmd = _docker_base(name, task_root, ws, image, interactive=False) + ["print"]
-    with file_lock(CONTAINER_LOCK):
-        while len(_running_solo_containers()) >= limit:
-            print(f"容器已达上限 {limit}，等待名额…", file=sys.stderr)
-            time.sleep(10)
-        _wait_launch_spacing(config)
-        stdin = open(state["promptPath"], "rb")
-        stdout = open(attempt_dir / "stdout.jsonl", "wb")
-        stderr = open(attempt_dir / "stderr.log", "wb")
-        proc = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
-        attempt["pid"] = proc.pid
-        save_state(task_root, state)
-        for _ in range(60):
-            if _container_running(name) or proc.poll() is not None:
-                break
-            time.sleep(0.5)
+    capacity.acquire(
+        capacity.holder_key(task_root),
+        limit=limit,
+        container=name,
+        task_root=task_root,
+        wait_seconds=float(config_get(config, "claude.slotWaitSeconds") or capacity.DEFAULT_WAIT_SECONDS),
+    )
+    _wait_launch_spacing(config)
+    stdin = open(state["promptPath"], "rb")
+    stdout = open(attempt_dir / "stdout.jsonl", "wb")
+    stderr = open(attempt_dir / "stderr.log", "wb")
+    proc = subprocess.Popen(cmd, stdin=stdin, stdout=stdout, stderr=stderr, env=env, start_new_session=True)
+    attempt["pid"] = proc.pid
+    save_state(task_root, state)
+    for _ in range(60):
+        if _container_running(name) or proc.poll() is not None:
+            break
+        time.sleep(0.5)
+    capacity.settle()
     print(f"[attempt {idx}] 容器 {name} 运行中（总时限 {int(timeout)} 秒，静默时限 {int(silent)} 秒）", file=sys.stderr)
     started = time.monotonic()
     last_size = 0
@@ -1386,12 +1401,33 @@ def cmd_repair(args: argparse.Namespace) -> None:
         poll_interval=float(args.poll_interval or config_get(config, "submission.pollIntervalSeconds") or 300),
         poll_timeout=float(args.poll_timeout or config_get(config, "submission.pollTimeoutSeconds") or 86400),
         locked_domain=str(config_get(config, "submission.lockedDomain") or ""),
+        review_score_delta=int(
+            config_get(config, "submission.localReviewScoreDelta") or submission.LOCAL_REVIEW_SCORE_DELTA
+        ),
+        review_min_similarity=float(
+            config_get(config, "submission.localReviewMinSimilarity") or submission.LOCAL_REVIEW_MIN_SIMILARITY
+        ),
     )
     emit(result)
+    if result.get("localReviewRequired"):
+        raise SystemExit(4)
     if result.get("repairRequired"):
         raise SystemExit(3)
     if not result.get("ok"):
         raise SystemExit(2)
+
+
+def cmd_local_review(args: argparse.Namespace) -> None:
+    decision = "approved" if args.approve else "rejected" if args.reject else ""
+    result = submission.local_review(
+        Path(args.task_root).resolve(),
+        decision=decision,
+        reviewer=str(args.reviewer or ""),
+        note=str(args.note or ""),
+    )
+    emit(result)
+    if result.get("status") in {"pending", "rejected"}:
+        raise SystemExit(4)
 
 
 # ======================================================================= export
@@ -1646,9 +1682,21 @@ def cmd_cleanup(args: argparse.Namespace) -> None:
     names = out(run(["docker", "ps", "-a", "--filter", f"label=solo2611.task={task_label(task_root)}",
                      "--format", "{{.Names}}"], check=False)).split()
     removed = [n for n in names if run(["docker", "rm", "-f", n], check=False).returncode == 0]
+    for n in removed:
+        capacity.release_container(n)
     state.pop("pendingContainer", None)
     save_state(task_root, state)
-    emit({"removed": removed})
+    emit({"removed": removed, "terminals": managed.sweep_session_terminals()})
+
+
+def cmd_capacity(args: argparse.Namespace) -> None:
+    """查看容器名额：上限、运行中、启动中和剩余。"""
+    emit(capacity.snapshot(int(config_get(load_config(), "claude.maxContainers") or 4)))
+
+
+def cmd_terminal_sweep(args: argparse.Namespace) -> None:
+    """关闭所有已结束会话残留的可见终端窗口；仍在运行的会话不受影响。"""
+    emit(managed.sweep_session_terminals())
 
 
 # ======================================================================= main
@@ -1836,6 +1884,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--poll-timeout", type=float)
     s.set_defaults(fn=cmd_repair)
 
+    s = sub.add_parser("local-review", help="查看或登记返修前的本地核验结论")
+    s.add_argument("--task-root", required=True)
+    decision = s.add_mutually_exclusive_group()
+    decision.add_argument("--approve", action="store_true")
+    decision.add_argument("--reject", action="store_true")
+    s.add_argument("--reviewer")
+    s.add_argument("--note")
+    s.set_defaults(fn=cmd_local_review)
+
     s = sub.add_parser("export", help="导出单题交付表")
     s.add_argument("--task-root", required=True)
     s.add_argument("--allow-incomplete", action="store_true")
@@ -1863,6 +1920,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--task-root", required=True)
     s.add_argument("--force", action="store_true")
     s.set_defaults(fn=cmd_cleanup)
+
+    s = sub.add_parser("capacity", help="查看容器名额占用")
+    s.set_defaults(fn=cmd_capacity)
+
+    s = sub.add_parser("terminal-sweep", help="关闭已结束会话残留的可见终端窗口")
+    s.set_defaults(fn=cmd_terminal_sweep)
 
     sub.add_parser("version", help="打印版本").set_defaults(fn=lambda a: print(version()))
     return p

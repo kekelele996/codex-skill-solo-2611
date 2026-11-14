@@ -39,8 +39,36 @@
 tmux 命令行、`ps` 输出和 `launch.sh` 都不包含 Key。题面发出后立即删除密钥临时文件。
 
 `claude.openTerminalOnRun=true` 时，技能会用 macOS AppleScript 新开 Terminal 窗口并执行
-`tmux attach-session -t <会话名>`。该窗口只负责显示；关闭窗口或按 `Ctrl+B`、`D` 脱离不会停止
-监督器和容器。默认关闭，避免无人值守运行、自动恢复和录屏阶段被弹窗打扰。
+`exec tmux attach-session -r -t <会话名>`。该窗口只负责显示：不抢键盘焦点，默认只读接入
+（`claude.terminalReadOnly=false` 时去掉 `-r`，`claude.terminalActivate=true` 时才把窗口提到前台）；
+关闭窗口或按 `Ctrl+B`、`D` 脱离不会停止监督器和容器。默认关闭，避免无人值守运行、自动恢复和
+录屏阶段被弹窗打扰。
+
+窗口回收：会话正常收尾、`abort`、启动失败、题面送达失败、重启换会话以及监督器退出时，都会关闭
+对应窗口并写入 `terminal.visible_close` 事件；启动新会话前、`cleanup` 和 `terminal-sweep` 会清扫
+所有已结束会话残留的窗口。判断依据是 tmux 会话是否还存在，会话存活或窗口里还有其它命令在运行时
+一律不关。窗口按标题或启动命令中的 `tmux attach … -t solo2611-*` 认领，旧版本打开的窗口同样能回收。
+
+启动容错：确认页（Bypass Permissions、信任文件夹、Press Enter to continue）统一按选项行解析，
+先移动光标、回读屏幕确认高亮在 `Yes` 选项上再回车，不会把 `Down` 和回车连发；tmux 会话消失
+（容器已退出）时返回 `session_exited` 并在 5 秒后重启，其余失败按 `launchSpacingSeconds` 间隔重启，
+最多 `claude.startAttempts`（默认 3）次；`tmux new-session` 失败自动重试 3 次。
+
+## 容器名额
+
+同时运行的 solo-2611 容器不得超过 `claude.maxContainers`。所有启动路径共用 `scripts/capacity.py`
+这一道闸：`run` 的受管模式、打印模式，以及 supervisor 的每一次重启，都要先拿到名额才能启动。
+
+- 占用数 = `docker ps --filter label=solo2611=true` 的运行中容器 + 尚未出现在 docker ps 里的
+  启动租约。租约记在 `~/.codex/solo-2611/container-leases.json`，覆盖“已经放行、容器还没起来”
+  的空窗；容器出现后租约自动让位，容器提前退出或经技能删除时租约立即归还，启动方崩溃时
+  300 秒后过期。
+- 计数和放行在同一把文件锁（`containers.lock`）内完成，多个会话同时执行 `run` 也只会按上限放行。
+- 同一道题重复申请只续期，不多占名额。
+- Docker 查询失败时一律不放行，不按“0 个容器”处理。
+- 名额满时每 5 秒重试，最多等 `claude.slotWaitSeconds`（默认 1800 秒）。受管模式在创建尝试
+  之前申请名额，等待时间不计入单题 3 小时总时限，也不消耗启动机会；超时后命令报错退出。
+- `python3 scripts/solo2611.py capacity` 查看上限、运行中的容器和启动中的租约。
 
 ## 轨迹结构（实测）
 

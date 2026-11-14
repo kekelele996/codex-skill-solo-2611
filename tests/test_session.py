@@ -469,32 +469,76 @@ def test_docker_command_mounts_bypass_settings(tmp_path: Path) -> None:
     assert f"src={settings_dir}" in mount
 
 
-def test_bypass_prompt_handles_wrapped_option_marker(
+def _fake_tmux(monkeypatch: pytest.MonkeyPatch, screens: list[str]) -> list[str]:
+    """Feed screens to wait_for_repl_state and record the keys it sends."""
+    feed = iter(screens)
+    last = [screens[-1]]
+    keys: list[str] = []
+
+    def capture(*_args: object, **_kwargs: object) -> str:
+        last[0] = next(feed, last[0])
+        return last[0]
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        if command[:2] == ["tmux", "send-keys"]:
+            keys.append(command[-1])
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(session, "capture_pane", capture)
+    monkeypatch.setattr(session.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(session, "run", fake_run)
+    return keys
+
+
+def test_bypass_prompt_verifies_selection_before_enter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    screens = iter(
+    keys = _fake_tmux(
+        monkeypatch,
         [
             "Bypass Permissions mode\n❯ No, exit\n  Yes, I accept",
             "Bypass Permissions mode\n  No, exit\n› Yes, I accept",
             "❯ ",
-        ]
+        ],
     )
-    calls: list[list[str]] = []
-    monkeypatch.setattr(session, "capture_pane", lambda *_args, **_kwargs: next(screens))
-    monkeypatch.setattr(session.time, "sleep", lambda _seconds: None)
-
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
-        calls.append(command)
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
-
-    monkeypatch.setattr(session, "run", fake_run)
     result = session.wait_for_repl_state("tmux-test", timeout=5)
 
     assert result["ok"] is True
-    assert result["confirmationAttempts"] == 2
-    assert result["strategies"][0] == "selected-no-then-down-enter"
-    assert result["strategies"][1] == "selected-yes-enter"
-    assert [call[-1] for call in calls] == ["Down", "C-m", "Enter"]
+    assert result["confirmationAttempts"] == 1
+    assert result["strategies"] == ["selected-no-then-down-enter"]
+    assert result["prompts"] == ["bypass"]
+    assert keys == ["Down", "C-m"]
+
+
+def test_bypass_prompt_never_confirms_while_exit_is_selected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stuck = "Bypass Permissions mode\n❯ No, exit\n  Yes, I accept"
+    keys = _fake_tmux(monkeypatch, [stuck] * 12 + ["Bypass Permissions mode\n  No, exit\n❯ Yes, I accept", "❯ "])
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert result["strategies"][0] == "moved-unverified"
+    assert keys[-1] in {"C-m", "Enter"}
+    assert set(keys[:-1]) == {"Down"}
+
+
+def test_startup_prompt_handles_numbered_trust_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trust = (
+        "Do you trust the files in this folder?\n"
+        "│ ❯ 1. Yes, proceed            │\n"
+        "│   2. No, exit                │\n"
+        "Enter to confirm · Esc to cancel"
+    )
+    keys = _fake_tmux(monkeypatch, [trust, "> "])
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert result["prompts"] == ["confirm"]
+    assert result["strategies"] == ["selected-yes-enter"]
+    assert keys == ["C-m"]
 
 
 def test_bypass_prompt_times_out_without_hanging(
@@ -526,27 +570,85 @@ def test_bypass_prompt_times_out_without_hanging(
 
     assert result["ok"] is False
     assert result["reason"] == "confirmation_timeout"
-    assert result["confirmationAttempts"] == 3
+    # 在整个确认时限内持续尝试，而不是按固定 3 次后干等。
+    assert result["confirmationAttempts"] >= 3
+
+
+def test_wait_for_repl_returns_at_once_when_session_exited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(session, "capture_pane", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(session, "tmux_alive", lambda _name: False)
+    monkeypatch.setattr(session.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        session.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + float(seconds)),
+    )
+    result = session.wait_for_repl_state("tmux-test", timeout=90)
+
+    assert result["ok"] is False
+    assert result["reason"] == "session_exited"
+    assert clock[0] < 5
+
+
+def test_launch_retries_tmux_new_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _task_root(tmp_path)
+    state = load_state(root)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    state["workspace"] = str(workspace)
+    state.setdefault("taskName", "demo-task")
+    outcomes = iter([1, 0])
+    created: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        if command[:2] == ["tmux", "new-session"]:
+            created.append(command)
+            return SimpleNamespace(returncode=next(outcomes), stdout=b"", stderr=b"server exited")
+        return SimpleNamespace(returncode=1, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(session, "run", fake_run)
+    monkeypatch.setattr(session, "container_exists", lambda _name: False)
+    monkeypatch.setattr(session, "close_session_terminal", lambda *_a, **_k: {"closed": 0})
+    monkeypatch.setattr(session.time, "sleep", lambda _seconds: None)
+    slots: list[str] = []
+    monkeypatch.setattr(
+        session.capacity, "acquire", lambda holder, **kwargs: slots.append(kwargs["container"]) or {}
+    )
+    launched = session.launch_tmux_container(
+        task_root=root, state=state, attempt=1, image="image", key="k", base_url="http://x"
+    )
+    assert len(created) == 2
+    assert launched["tmux"].startswith("solo2611-")
+    # 每次受管启动都先过容量闸门，并登记将要启动的容器名。
+    assert slots == [launched["container"]]
 
 
 def test_open_session_terminal_uses_terminal_app(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: list[list[str]] = []
+    scripts: list[str] = []
     monkeypatch.setattr(session.sys, "platform", "darwin")
+    monkeypatch.setattr(session.terminal_view.sys, "platform", "darwin")
     monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+    monkeypatch.setattr(session, "load_config", lambda: {"claude": {}})
 
-    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
-        calls.append(command)
-        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    def fake_osascript(script: str, **_: object) -> SimpleNamespace:
+        scripts.append(script)
+        return SimpleNamespace(returncode=0, stdout="42\x1f/dev/ttys009\n", stderr="")
 
-    monkeypatch.setattr(session, "run", fake_run)
+    monkeypatch.setattr(session.terminal_view, "_osascript", fake_osascript)
     result = session.open_session_terminal("solo2611-safe-name")
     assert result["opened"] is True
-    assert calls and calls[0][:2] == ["osascript", "-e"]
-    script = calls[0][2]
+    assert result["windowId"] == 42
+    assert result["readOnly"] is True
+    script = scripts[0]
     assert 'tell application "Terminal"' in script
-    assert "tmux attach-session -t solo2611-safe-name" in script
+    assert "tmux attach-session -r -t solo2611-safe-name" in script
+    # 不能抢键盘焦点，否则用户正在别处敲的键会落进受管会话。
+    assert "activate" not in script
 
 
 def test_open_session_terminal_is_optional(
@@ -576,15 +678,86 @@ def test_open_session_terminal_timeout_does_not_block(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(session.sys, "platform", "darwin")
+    monkeypatch.setattr(session.terminal_view.sys, "platform", "darwin")
     monkeypatch.setattr(session, "tmux_alive", lambda _: True)
+    monkeypatch.setattr(session, "load_config", lambda: {"claude": {}})
+    monkeypatch.setattr(session.terminal_view.time, "sleep", lambda _seconds: None)
 
-    def timeout(command: list[str], **_: object) -> SimpleNamespace:
-        raise session.subprocess.TimeoutExpired(command, 15)
+    def timeout(script: str, **_: object) -> SimpleNamespace:
+        raise session.subprocess.TimeoutExpired(["osascript"], 15)
 
-    monkeypatch.setattr(session, "run", timeout)
+    monkeypatch.setattr(session.terminal_view, "_osascript", timeout)
     result = session.open_session_terminal("solo2611-safe-name")
     assert result["opened"] is False
     assert "timed out" in result["error"]
+
+
+def _terminal_rows(monkeypatch: pytest.MonkeyPatch, rows: list[dict]) -> list[int]:
+    view = session.terminal_view
+    closed: list[int] = []
+    monkeypatch.setattr(view.sys, "platform", "darwin")
+    monkeypatch.setattr(view, "terminal_running", lambda: True)
+    monkeypatch.setattr(view.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        view, "list_tabs", lambda: [row for row in rows if row["windowId"] not in closed]
+    )
+
+    def close(row: dict) -> bool:
+        closed.append(row["windowId"])
+        return True
+
+    monkeypatch.setattr(view, "_close_row", close)
+    return closed
+
+
+def test_terminal_sweep_only_closes_views_of_dead_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {"windowId": 1, "tty": "/dev/ttys001", "busy": False, "tmux": "solo2611-dead"},
+        {"windowId": 2, "tty": "/dev/ttys002", "busy": False, "tmux": "solo2611-alive"},
+        {"windowId": 3, "tty": "/dev/ttys003", "busy": True, "tmux": "solo2611-dead"},
+        {"windowId": 4, "tty": "/dev/ttys004", "busy": False, "tmux": ""},
+    ]
+    closed = _terminal_rows(monkeypatch, rows)
+    result = session.terminal_view.sweep(lambda name: name == "solo2611-alive")
+    assert closed == [1]
+    assert result == {"closed": 1, "kept": 2, "sessions": ["solo2611-dead"]}
+
+
+def test_terminal_close_skips_live_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [{"windowId": 1, "tty": "/dev/ttys001", "busy": False, "tmux": "solo2611-live"}]
+    closed = _terminal_rows(monkeypatch, rows)
+    view = session.terminal_view
+    result = view.close_window("solo2611-live", alive=lambda _name: True, wait_seconds=0)
+    assert closed == []
+    assert result["skipped"] == 1 and result["reason"] == "session_alive"
+    result = view.close_window("solo2611-live", alive=lambda _name: False, wait_seconds=0)
+    assert closed == [1]
+    assert result["closed"] == 1
+
+
+def test_terminal_tabs_are_claimed_by_title_or_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    view = session.terminal_view
+    f, r = view.FIELD, view.RECORD
+    listing = (
+        f"1{f}/dev/ttys001{f}solo2611-view:solo2611-a-01-abcd{f}false{f}{r}"
+        f"2{f}/dev/ttys002{f}exec tmux attach-session -r -t solo2611-b-01-abcd{f}false{f}{r}"
+        f"3{f}/dev/ttys003{f}zsh{f}false{f}$ tmux attach-session -t solo2611-c-01-abcd\n{r}"
+        f"4{f}/dev/ttys004{f}zsh{f}true{f}$ ls\n{r}"
+    )
+    monkeypatch.setattr(view.sys, "platform", "darwin")
+    monkeypatch.setattr(view, "terminal_running", lambda: True)
+    monkeypatch.setattr(
+        view, "_osascript", lambda *_a, **_k: SimpleNamespace(returncode=0, stdout=listing, stderr="")
+    )
+    rows = view.list_tabs()
+    assert [(row["tmux"], row["matchedBy"]) for row in rows] == [
+        ("solo2611-a-01-abcd", "title"),
+        ("solo2611-b-01-abcd", "title-command"),
+        ("solo2611-c-01-abcd", "history"),
+        ("", ""),
+    ]
 
 
 def test_abort_is_terminal_and_writes_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
