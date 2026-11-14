@@ -21,6 +21,7 @@ os.environ.setdefault("SOLO2611_CONFIG", str(TMP / "codex" / "solo-2611" / "conf
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import evidence  # noqa: E402
+import feedback as fb  # noqa: E402
 from common import Solo2611Error  # noqa: E402
 
 PROMPT = "日批任务要保证重复执行同一批时不新增订单，失败后续跑从已处理水位继续。"
@@ -305,6 +306,71 @@ def test_feedback_cannot_claim_business_runtime_when_trace_is_static_only(tmp_pa
     assert bounded["traceAlignment"]["status"] == "passed"
     assert bounded["traceAlignment"]["unsupportedRuntimeClaims"] == []
     assert not any("超出轨迹能证明的验证层级" in item for item in bounded["errors"])
+
+
+def test_high_score_against_negative_trace_waits_for_local_review(tmp_path):
+    events = _events(final="未能完成规则更新，关键导入路径仍然缺少校验。")
+    root, state, ws = _task(tmp_path, events=events)
+    _record(root, ws, "print('本轮检查完成')\n")
+    checked = evidence.check(
+        root,
+        state,
+        "逐项核对后规则更新已经完成，导入路径能够正常通过校验。",
+        4,
+    )
+    alignment = checked["traceAlignment"]
+    assert alignment["traceOpinion"]["status"] == "negative"
+    assert alignment["traceOpinion"]["conflicts"]
+
+    pending = fb._review_consistency(
+        root,
+        score=4,
+        feedback="逐项核对后规则更新已经完成，导入路径能够正常通过校验。",
+        alignment=alignment,
+    )
+    assert pending["required"] is True and pending["status"] == "pending"
+    approved = fb.review_consistency(
+        root,
+        decision="approved",
+        reviewer="专家甲",
+        note="已对照本机运行结果和原始轨迹",
+    )
+    assert approved["status"] == "approved"
+    again = fb._review_consistency(
+        root,
+        score=4,
+        feedback="逐项核对后规则更新已经完成，导入路径能够正常通过校验。",
+        alignment=alignment,
+    )
+    assert again["status"] == "approved"
+
+
+def test_feedback_check_returns_local_review_gate_for_trace_disagreement(tmp_path):
+    events = _events(final="未能完成规则更新，关键导入路径仍然缺少校验。")
+    root, state, ws = _task(tmp_path, events=events)
+    _record(root, ws, "print('订单 120 行')\n")
+    path = root / "delivery" / "feedback.md"
+    path.write_text(
+        "## 交付完整性\n\n4\n\n## Feedback\n\n"
+        "过程问题：逐项核对后规则更新已经完成，导入路径能够正常通过校验，重复执行同一批保持结果不变。\n\n"
+        "产物问题：页面能够展示当前规则，接口回读正常，失败输入会给出明确提示，恢复后仍能继续处理；"
+        "错误输入的边界回归仍需在恢复入口补齐。\n",
+        encoding="utf-8",
+    )
+    checked = fb.check(path, task_root=root, state=state)
+    assert checked["localReviewRequired"] is True
+    assert checked["localReviewStatus"] == "pending"
+    assert checked["ok"] is False
+
+    fb.review_consistency(
+        root,
+        decision="approved",
+        reviewer="专家甲",
+        note="已对照原始轨迹和本机运行",
+    )
+    approved = fb.check(path, task_root=root, state=state)
+    assert approved["localReviewStatus"] == "approved"
+    assert not any("总体结论出入较大" in item for item in approved["errors"])
 
 
 # ======================================================================= 索引与摘要

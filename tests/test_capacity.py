@@ -84,6 +84,25 @@ def test_removed_container_releases_its_lease(gate: Docker) -> None:
     assert [item["container"] for item in view["pending"]] == ["c-b"] and view["free"] == 1
 
 
+def test_release_keeps_the_lease_when_the_launcher_is_already_running(
+    gate: Docker,
+) -> None:
+    capacity.acquire("task:a", limit=1, container="c-a")
+    gate.add("c-a")
+    assert capacity.release("task:a") is False
+    assert capacity.snapshot(1)["used"] == 1
+
+
+def test_legacy_managed_prefix_is_counted_without_a_label() -> None:
+    names = capacity._parse_managed_names(
+        "solo2611-legacy-01-abcd\t\n"
+        "custom-labelled\ttrue\n"
+        "project-hub-api-1\t\n"
+        "custom-app\tfalse\n"
+    )
+    assert names == {"solo2611-legacy-01-abcd", "custom-labelled"}
+
+
 def test_settle_drops_leases_docker_already_counts(gate: Docker) -> None:
     capacity.acquire("task:a", limit=2, container="c-a")
     gate.add("c-a")

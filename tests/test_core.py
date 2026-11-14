@@ -117,9 +117,10 @@ def test_legacy_valid_domain_is_preserved():
         "defaults": {"domain": "游戏、图形与多媒体", "subDirection": "图形渲染"},
     }, ensure_ascii=False), encoding="utf-8")
     config = load_config()
-    assert config["configVersion"] == 4
+    assert config["configVersion"] == 5
     assert config["defaults"]["domain"] == "游戏、图形与多媒体"
     assert config["defaults"]["subDirection"] == "图形渲染"
+    assert config["claude"]["timeoutSeconds"] >= 10800
 
 
 def test_legacy_data_other_default_migrates_to_data_lake():
@@ -130,9 +131,28 @@ def test_legacy_data_other_default_migrates_to_data_lake():
         "defaults": {"domain": "数据工程", "subDirection": "其他"},
     }, ensure_ascii=False), encoding="utf-8")
     config = load_config()
-    assert config["configVersion"] == 4
+    assert config["configVersion"] == 5
     assert config["defaults"]["domain"] == "数据工程"
     assert config["defaults"]["subDirection"] == "数仓与数据湖"
+    path.unlink()
+
+
+def test_session_timeout_has_three_hour_floor():
+    path = Path(os.environ["SOLO2611_CONFIG"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "configVersion": 4,
+                "claude": {"timeoutSeconds": 7200, "replTimeoutSeconds": 90},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = load_config()
+    assert config["configVersion"] == 5
+    assert config["claude"]["timeoutSeconds"] == 10800
+    assert config["claude"]["replTimeoutSeconds"] >= 120
     path.unlink()
 
 

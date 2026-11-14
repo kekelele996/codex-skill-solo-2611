@@ -12,6 +12,7 @@ import string
 import subprocess
 import sys
 import time
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -699,9 +700,16 @@ def cmd_run(args: argparse.Namespace) -> None:
         try:
             result = managed.start_supervised(task_root, load_state(task_root), int(attempt["index"]))
         except Exception as exc:
-            capacity.release(holder)
             failed_state = load_state(task_root)
             failed_run = failed_state.setdefault("sessionRun", {})
+            failed_container = str(failed_run.get("container") or attempt.get("container") or "")
+            failed_tmux = str(failed_run.get("tmuxSession") or "")
+            if failed_container or failed_tmux:
+                with suppress(Exception):
+                    managed._remove_tmux_and_container(failed_container, failed_tmux)
+            # A launched container may already be running even if bookkeeping
+            # failed. `release` refuses to give its slot away in that case.
+            capacity.release(holder)
             failed_run["status"] = "start_failed"
             failed_run["error"] = f"{type(exc).__name__}: {exc}"
             failed_state["status"] = "prompt_ready"
@@ -1313,7 +1321,9 @@ def cmd_feedback(args: argparse.Namespace) -> None:
             "feedbackRuntimeCeiling": trace_alignment.get("feedbackRuntimeCeiling"),
             "traceCapabilityLevel": trace_alignment.get("traceCapabilityLevel"),
             "unsupportedRuntimeClaims": trace_alignment.get("unsupportedRuntimeClaims") or [],
+            "traceOpinion": trace_alignment.get("traceOpinion") or {},
         },
+        "localReview": result.get("localReview") or {},
         "checkedAt": utc_now(),
     }
     write_json(task_root / "monitor" / "feedback-evidence.json", verification)
@@ -1329,6 +1339,7 @@ def cmd_feedback(args: argparse.Namespace) -> None:
             "unsupportedRuntimeClaims": trace_alignment.get("unsupportedRuntimeClaims") or [],
         },
         "fullScoreReview": result.get("fullScoreReview") or {},
+        "localReview": result.get("localReview") or {},
         "verificationSha256": verification["sha256"],
     }
     save_state(task_root, state)
@@ -1337,7 +1348,12 @@ def cmd_feedback(args: argparse.Namespace) -> None:
         "evidence": ev.get("summary") or {},
         "traceAlignment": trace_alignment,
         "fullScoreReview": result.get("fullScoreReview") or {},
+        "localReviewRequired": bool(result.get("localReviewRequired")),
+        "localReviewStatus": result.get("localReviewStatus") or "not_required",
+        "localReview": result.get("localReview") or {},
     })
+    if result.get("localReviewStatus") in {"pending", "rejected"}:
+        raise SystemExit(4)
     if not result["ok"]:
         raise SystemExit(2)
 
@@ -1424,6 +1440,7 @@ def cmd_local_review(args: argparse.Namespace) -> None:
         decision=decision,
         reviewer=str(args.reviewer or ""),
         note=str(args.note or ""),
+        kind=str(args.kind or "auto"),
     )
     emit(result)
     if result.get("status") in {"pending", "rejected"}:
@@ -1891,6 +1908,7 @@ def build_parser() -> argparse.ArgumentParser:
     decision.add_argument("--reject", action="store_true")
     s.add_argument("--reviewer")
     s.add_argument("--note")
+    s.add_argument("--kind", choices=["auto", "feedback", "repair"], default="auto")
     s.set_defaults(fn=cmd_local_review)
 
     s = sub.add_parser("export", help="导出单题交付表")

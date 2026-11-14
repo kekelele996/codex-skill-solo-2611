@@ -75,10 +75,17 @@ BYPASS_OPTION = re.compile(
 # 启动阶段可能出现的确认页：Bypass Permissions、信任文件夹等。统一按“选项行”解析。
 STARTUP_OPTION = re.compile(
     r"(?m)^[ \t│|]*(?P<mark>❯|›|>|➜|→|●|◉|\*)?[ \t]*(?:○|◯)?[ \t]*"
-    r"(?:(?P<num>\d+)[.)][ \t]*)?(?P<text>(?:Yes|No)\b[^\n│|]*?)[ \t│|]*$"
+    r"(?:(?P<num>\d+)[.)][ \t]*)?"
+    r"(?P<text>(?:(?:Yes|No)\b|(?:是|否)(?=[\s，,、:：]|$)|继续|确定|允许|同意)[^\n│|]*?)"
+    r"[ \t│|]*$"
 )
-STARTUP_CONFIRM_HINT = re.compile(r"(?i)enter to confirm|esc to cancel|do you trust|trust the files")
-STARTUP_CONTINUE_HINT = re.compile(r"(?i)press enter to continue")
+STARTUP_CONFIRM_HINT = re.compile(
+    r"(?i)(?:enter to confirm|esc to cancel|do you trust|trust (?:the )?(?:files|folder)|"
+    r"(?:allow|grant).{0,24}(?:access|folder|project|permission)|"
+    r"是否信任|信任.{0,16}文件夹|允许.{0,20}(?:访问|读取|使用)|确认.{0,16}(?:权限|文件夹))"
+)
+STARTUP_CONTINUE_HINT = re.compile(r"(?i)(?:press enter to continue|按\s*enter\s*继续|按回车继续)")
+ACCEPT_OPTION_PREFIXES = ("yes", "是", "继续", "确定", "允许", "同意")
 ATTEMPT_RUNTIME_FILES = ("env.sh", "launch.sh")
 ROUND_STOP_REASONS = {"end_turn", "max_tokens", "stop_sequence"}
 RETRY_AFTER = re.compile(r"(?i)retry[-_ ]after[^0-9]{0,12}(\d+)")
@@ -829,11 +836,12 @@ def _startup_options(screen: str) -> list[dict[str, Any]]:
     options: list[dict[str, Any]] = []
     for match in STARTUP_OPTION.finditer(screen or ""):
         text = match.group("text").strip()
+        lowered = text.lower()
         options.append(
             {
                 "text": text,
                 "selected": bool(match.group("mark")),
-                "accept": text.lower().startswith("yes"),
+                "accept": lowered.startswith(ACCEPT_OPTION_PREFIXES),
             }
         )
     return options
@@ -845,7 +853,7 @@ def _startup_prompt(screen: str) -> str:
         return "bypass"
     options = _startup_options(screen)
     if (
-        STARTUP_CONFIRM_HINT.search(screen or "")
+        (STARTUP_CONFIRM_HINT.search(screen or "") or "Bypass Permissions" in (screen or ""))
         and any(item["accept"] for item in options)
         and any(not item["accept"] for item in options)
     ):
@@ -885,14 +893,28 @@ def _accept_bypass_prompt(name: str, screen: str, attempt: int) -> str:
         _send_key(name, confirm_key)
         return "selected-yes-enter"
     if offset is None:
-        # 高亮标记没认出来（终端换行或字符集差异）。先只移动光标，下一轮再读屏；
-        # 多次仍认不出时才盲按，盲按前留足间隔，避免两个键被合并处理。
-        _send_key(name, "Down")
-        if attempt >= 5 and attempt % 3 == 2:
-            time.sleep(1.0)
+        # 新版 TUI 可能只用反色块表示选中，不输出 ❯。此时绝不能先按 Down：
+        # 常见确认页默认已经选中第一项 Yes，多按一次会让回车落到 No。
+        options = _startup_options(screen)
+        accept_index = next((index for index, item in enumerate(options) if item["accept"]), None)
+        if accept_index == 0:
+            if attempt == 0:
+                _send_key(name, "Up")
+                return "normalize-first-option"
             _send_key(name, confirm_key)
-            return "blind-down-enter"
-        return "down-sent-await-selection"
+            return "unmarked-yes-first-enter"
+        if accept_index is not None:
+            if attempt % 2 == 0:
+                _send_key(name, "Down")
+                return "unmarked-yes-move"
+            _send_key(name, confirm_key)
+            return "unmarked-yes-enter"
+        # 页面只给出“按回车继续”或样式完全不可见时，先短暂停留再回车。
+        if attempt == 0:
+            time.sleep(0.8)
+            return "unmarked-wait"
+        _send_key(name, confirm_key)
+        return "unmarked-enter"
     key = "Down" if offset > 0 else "Up"
     for _ in range(abs(offset)):
         _send_key(name, key)
@@ -1433,9 +1455,8 @@ def start_supervised(
     base_url = os.environ.get("SOLO2611_BASE_URL", "").strip() or str(claude.get("baseUrl") or "").strip()
     if not key:
         raise Solo2611Error("缺少本期团队 API Key")
-    if claude.get("openTerminalOnRun"):
-        # 先收回以前会话留下的窗口，避免越开越多。
-        sweep_session_terminals()
+    # 无论本次是否打开可见窗口，都顺手收回旧版本或监督器异常退出后留下的托管窗口。
+    sweep_session_terminals()
     attempt = _state_attempt(state, attempt_index)
     if attempt is None:
         raise Solo2611Error(f"找不到 attempt {attempt_index}")
@@ -1915,6 +1936,7 @@ def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> 
         last_size = 0
         last_growth_at = time.monotonic()
         last_heartbeat = time.monotonic()
+        last_terminal_sweep = time.monotonic()
         gateway_failures = sum(1 for item in session.get("rounds") or [] if item.get("kind") == "gateway")
         trace_reader: IncrementalTrace | None = None
         try:
@@ -2129,6 +2151,18 @@ def _supervisor_loop(task_root: Path, attempt: int, *, attach: bool = False) -> 
                     _heartbeat(state)
                     save_state(task_root, state)
                     append_event(task_root, attempt, "supervisor.heartbeat", pid=os.getpid())
+                if now - last_terminal_sweep >= 60:
+                    last_terminal_sweep = now
+                    swept = sweep_session_terminals()
+                    if swept.get("closed"):
+                        append_event(
+                            task_root,
+                            attempt,
+                            "terminal.periodic_sweep",
+                            closed=swept.get("closed"),
+                            sessions=swept.get("sessions"),
+                            error=swept.get("error"),
+                        )
                 commands = _consume_commands(task_root, attempt)
                 if commands and _handle_human_commands(task_root, state, attempt, commands):
                     save_state(task_root, state)

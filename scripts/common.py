@@ -32,7 +32,7 @@ DEFAULT_TASKS_DIR = Path.home() / "claude-runs" / "solo-2611"
 DEFAULT_BASE_URL = "https://llm2.jzxhnh.com"  # 镜像内置的 ANTHROPIC_BASE_URL
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "configVersion": 4,
+    "configVersion": 5,
     "claude": {
         "apiKey": "",
         "baseUrl": DEFAULT_BASE_URL,
@@ -45,7 +45,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "runMode": "supervised",
         "continueMax": 2,
         "startAttempts": 3,
-        "replTimeoutSeconds": 90,
+        "replTimeoutSeconds": 180,
         "slotWaitSeconds": 1800,
         "fatalHoldMinutes": 30,
         "openTerminalOnRun": False,
@@ -153,10 +153,18 @@ def load_config() -> dict[str, Any]:
         claude.setdefault("openTerminalOnRun", False)
         claude["timeoutSeconds"] = max(10800, int(claude.get("timeoutSeconds") or 10800))
         config["configVersion"] = 4
+    if int(config.get("configVersion") or 0) < 5:
+        claude = config.setdefault("claude", {})
+        # v5 keeps the normal single-session budget at three hours. A longer
+        # value is preserved; an old two-hour override is lifted to the floor.
+        claude["timeoutSeconds"] = max(10800, int(claude.get("timeoutSeconds") or 10800))
+        claude["replTimeoutSeconds"] = max(120, int(claude.get("replTimeoutSeconds") or 180))
+        config["configVersion"] = 5
     claude = config.setdefault("claude", {})
+    claude["timeoutSeconds"] = max(10800, int(claude.get("timeoutSeconds") or 10800))
     claude["continueMax"] = min(2, max(0, int(claude.get("continueMax") or 0)))
     claude["startAttempts"] = min(3, max(1, int(claude.get("startAttempts") or 3)))
-    claude["replTimeoutSeconds"] = min(600, max(30, int(claude.get("replTimeoutSeconds") or 90)))
+    claude["replTimeoutSeconds"] = min(600, max(120, int(claude.get("replTimeoutSeconds") or 180)))
     claude["launchSpacingSeconds"] = max(5, int(claude.get("launchSpacingSeconds") or 20))
     claude["silentSeconds"] = max(60, int(claude.get("silentSeconds") or 1200))
     claude["noProgressSeconds"] = max(60, int(claude.get("noProgressSeconds") or 1200))

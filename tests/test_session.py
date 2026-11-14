@@ -541,6 +541,56 @@ def test_startup_prompt_handles_numbered_trust_dialog(
     assert keys == ["C-m"]
 
 
+def test_unmarked_yes_first_never_presses_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trust = (
+        "Do you trust the files in this folder?\n"
+        "Yes, proceed\n"
+        "No, exit\n"
+        "Enter to confirm · Esc to cancel"
+    )
+    keys = _fake_tmux(monkeypatch, [trust, trust, "> "])
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert "Down" not in keys
+    assert keys == ["Up", "Enter"]
+
+
+def test_unmarked_yes_second_moves_down_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trust = (
+        "Do you trust the files in this folder?\n"
+        "No, exit\n"
+        "Yes, proceed\n"
+        "Enter to confirm · Esc to cancel"
+    )
+    keys = _fake_tmux(monkeypatch, [trust, trust, "> "])
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert keys == ["Down", "Enter"]
+
+
+def test_startup_prompt_handles_chinese_trust_dialog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trust = (
+        "是否信任此文件夹中的文件？\n"
+        "❯ 1. 是，继续\n"
+        "  2. 否，退出\n"
+        "按 Enter 确认 · Esc 取消"
+    )
+    keys = _fake_tmux(monkeypatch, [trust, "> "])
+    result = session.wait_for_repl_state("tmux-test", timeout=5)
+
+    assert result["ok"] is True
+    assert result["prompts"] == ["confirm"]
+    assert keys == ["C-m"]
+
+
 def test_bypass_prompt_times_out_without_hanging(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -646,7 +696,7 @@ def test_open_session_terminal_uses_terminal_app(
     assert result["readOnly"] is True
     script = scripts[0]
     assert 'tell application "Terminal"' in script
-    assert "tmux attach-session -r -t solo2611-safe-name" in script
+    assert "terminal_view.py attach-session --tmux solo2611-safe-name --read-only" in script
     # 不能抢键盘焦点，否则用户正在别处敲的键会落进受管会话。
     assert "activate" not in script
 
@@ -723,6 +773,31 @@ def test_terminal_sweep_only_closes_views_of_dead_sessions(
     result = session.terminal_view.sweep(lambda name: name == "solo2611-alive")
     assert closed == [1]
     assert result == {"closed": 1, "kept": 2, "sessions": ["solo2611-dead"]}
+
+
+def test_terminal_sweep_closes_busy_owned_title_after_session_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows = [
+        {
+            "windowId": 1,
+            "tty": "/dev/ttys001",
+            "busy": True,
+            "tmux": "solo2611-dead",
+            "matchedBy": "title",
+        },
+        {
+            "windowId": 2,
+            "tty": "/dev/ttys002",
+            "busy": True,
+            "tmux": "solo2611-dead",
+            "matchedBy": "history",
+        },
+    ]
+    closed = _terminal_rows(monkeypatch, rows)
+    result = session.terminal_view.sweep(lambda _name: False)
+    assert closed == [1]
+    assert result["closed"] == 1 and result["kept"] == 1
 
 
 def test_terminal_close_skips_live_session(monkeypatch: pytest.MonkeyPatch) -> None:

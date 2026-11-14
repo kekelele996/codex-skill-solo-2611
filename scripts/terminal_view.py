@@ -8,17 +8,23 @@ must never fail or delay the managed session itself.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Callable
 
 TITLE_PREFIX = "solo2611-view:"
 FIELD = "\x1f"
 RECORD = "\x1e"
-ATTACH_RE = re.compile(r"tmux attach(?:-session)?(?: -r)? -t (solo2611-[0-9a-z-]+)")
+ATTACH_RE = re.compile(
+    r"(?:tmux attach(?:-session)?(?: -r)? -t|terminal_view\.py attach-session(?: -r)? --tmux) "
+    r"(solo2611-[0-9a-z-]+)"
+)
 HISTORY_LIMIT = 4000
 
 
@@ -59,9 +65,24 @@ def terminal_running() -> bool:
     return result.returncode == 0 and bool(result.stdout.strip())
 
 
+def attach_command(tmux_name: str, *, read_only: bool = True) -> str:
+    """Run a small helper so the visible window closes even if the supervisor dies."""
+    script = Path(__file__).resolve()
+    python = shutil.which("python3") or sys.executable
+    args = [
+        python,
+        str(script),
+        "attach-session",
+        "--tmux",
+        tmux_name,
+    ]
+    if read_only:
+        args.append("--read-only")
+    return "exec " + " ".join(shlex.quote(part) for part in args)
+
+
 def open_script(tmux_name: str, *, read_only: bool = True, activate: bool = False) -> str:
-    flag = "-r " if read_only else ""
-    command = f"exec tmux attach-session {flag}-t {shlex.quote(tmux_name)}"
+    command = attach_command(tmux_name, read_only=read_only)
     lines = ['tell application "Terminal"']
     if activate:
         lines.append("  activate")
@@ -225,12 +246,88 @@ def close_script(window_id: int, tty: str) -> str:
     )
 
 
+def close_tty_script(tty: str) -> str:
+    """Close the Terminal window that owns this exact tty."""
+    return "\n".join(
+        [
+            'tell application "Terminal"',
+            "  set closedCount to 0",
+            "  repeat with w in windows",
+            "    try",
+            "      set owned to false",
+            "      repeat with t in tabs of w",
+            f'        if (tty of t) is "{_escape(tty)}" then set owned to true',
+            "      end repeat",
+            "      if owned then",
+            "        close w saving no",
+            "        set closedCount to closedCount + 1",
+            "      end if",
+            "    end try",
+            "  end repeat",
+            "  return closedCount",
+            "end tell",
+        ]
+    )
+
+
 def _close_row(row: dict[str, Any]) -> bool:
     try:
         result = _osascript(close_script(int(row["windowId"]), str(row["tty"])))
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0 and result.stdout.strip() not in {"", "0"}
+
+
+def _close_current_tty() -> bool:
+    """Close the Terminal view after tmux exits; never affect another tty."""
+    if not supported():
+        return False
+    try:
+        tty = tty_name()
+    except OSError:
+        return False
+    if not tty:
+        return False
+    try:
+        result = _osascript(close_tty_script(tty), timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and result.stdout.strip() not in {"", "0"}
+
+
+def _close_session_view(tmux_name: str) -> int:
+    """Fallback: close the exact managed view even when stdin lost its tty path."""
+    closed = 0
+    for row in list_tabs():
+        if row.get("tmux") == tmux_name and _close_row(row):
+            closed += 1
+    return closed
+
+
+def tty_name(fd: int = 0) -> str:
+    """Return the controlling terminal path without shelling out."""
+    try:
+        return os.ttyname(fd)
+    except OSError:
+        return ""
+
+
+def attach_session(tmux_name: str, *, read_only: bool = True) -> int:
+    """Attach in the foreground and close this Terminal view when the session ends."""
+    command = ["tmux", "attach-session"]
+    if read_only:
+        command.append("-r")
+    command.extend(["-t", tmux_name])
+    code = 1
+    try:
+        result = subprocess.run(command, check=False)
+        code = int(result.returncode)
+    finally:
+        # tmux can disappear because Claude exited, abort cleaned the session,
+        # or the supervisor crashed. In every case this disposable view should go.
+        if not _close_current_tty():
+            _close_session_view(tmux_name)
+    return code
 
 
 def tmux_alive(tmux_name: str) -> bool:
@@ -277,7 +374,14 @@ def close_window(
         rows = [row for row in list_tabs() if row["tmux"] == tmux_name]
         if not rows:
             break
-        pending = [row for row in rows if not row["busy"]]
+        # A tab created for one of our tmux views is ours even if Terminal keeps
+        # its stale ``busy`` flag after ``exec tmux attach`` returns. History-only
+        # matches are more conservative because the tab may already be reused.
+        pending = [
+            row
+            for row in rows
+            if not row["busy"] or row.get("matchedBy") in {"title", "title-command"}
+        ]
         if not pending:
             return {"closed": closed, "skipped": len(rows), "tmux": tmux_name, "reason": "window_busy"}
         for row in pending:
@@ -297,11 +401,34 @@ def sweep(alive: Callable[[str], bool]) -> dict[str, Any]:
         name = str(row["tmux"])
         if not name:
             continue
-        # busy 为真说明窗口里还有别的命令在跑（多半是用户自己的窗口），不动它。
-        if row["busy"] or alive(name):
+        # Our titled/command-claimed view is disposable after its tmux session
+        # ends, even when Terminal still reports the unreliable busy flag.
+        # History-only matches stay protected because that tab may be reused.
+        disposable = row.get("matchedBy") in {"title", "title-command"}
+        if alive(name) or (row["busy"] and not disposable):
             kept += 1
             continue
         if _close_row(row):
             closed += 1
             sessions.append(name)
     return {"closed": closed, "kept": kept, "sessions": sessions}
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 3 or sys.argv[1] != "attach-session":
+        raise SystemExit("usage: terminal_view.py attach-session --tmux NAME [--read-only]")
+    session_name = ""
+    index = 2
+    while index < len(sys.argv):
+        value = sys.argv[index]
+        if value == "--tmux" and index + 1 < len(sys.argv):
+            session_name = sys.argv[index + 1]
+            index += 2
+            continue
+        if value == "--read-only":
+            index += 1
+            continue
+        raise SystemExit(f"unknown argument: {value}")
+    if not session_name:
+        raise SystemExit("missing --tmux")
+    raise SystemExit(attach_session(session_name, read_only="--read-only" in sys.argv))

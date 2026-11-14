@@ -96,6 +96,24 @@ python3 $S verify --task-root ROOT --label '移走源文件后重试' -- python3
 `feedback --check` 会执行轨迹能力对齐审计，并把结果写到 `monitor/feedback-trace-audit.json`；
 发现“轨迹已明确运行受限、正文仍写业务验证成功”时直接阻断。
 
+### Feedback 与轨迹总体意见冲突
+
+轨迹最后一轮明确写“未完成、未实现、仍缺关键路径或被阻断”，而高分 Feedback 只留下“逐项核对后已经完成”
+这类正向判断时，机器会把它标为总体意见冲突，而不是让一句更自然的话绕过去。`feedback --check` 会生成
+`monitor/submission/feedback-consistency-review.json` 并以退出码 4 停下。
+
+标注专家对照原始轨迹、产物快照和本机运行结果后登记：
+
+```bash
+python3 $S feedback --task-root ROOT --check
+python3 $S local-review --task-root ROOT --kind feedback
+python3 $S local-review --task-root ROOT --kind feedback \
+  --approve --reviewer 姓名 --note "已对照原始轨迹和本机运行"
+python3 $S feedback --task-root ROOT --check
+```
+
+批准只覆盖当时的评分、正文和轨迹结论指纹。修改其中任一项后，旧批准失效并重新等待核验。
+
 ### 什么时候可以写代码和数值
 
 判断标准：删掉它，读者还能不能明白问题在哪、能不能定位。不能，就保留。比较重要的问题通常保留

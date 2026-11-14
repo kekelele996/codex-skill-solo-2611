@@ -25,6 +25,8 @@ description: >
 - 首轮题面只有在实时 Claude Code 轨迹里出现内容完全一致的真人消息时才算送达。8 秒没有轨迹时补按
   回车，20 秒时清空输入框并重发同一题面，36 秒再补按回车，50 秒做第二次同文重发；75 秒仍没有
   证据才按启动失败处理并重新排队。所有补发都在原 tmux/Claude Code 会话内完成，不新增用户指令。
+- 单个受管会话总时限不低于 3 小时（`claude.timeoutSeconds=10800`）；工作台的会话陈旧判定也同步
+  到 3 小时，不能再用 90 分钟把仍正常工作的会话判为过期。
 - 收到任务级“继续”时，先运行 `run-status --json` 和 `resume`，从状态文件与事件日志接回现有会话。
   不重新 `init`、不重新发送题面、不执行 `reset`，也不把任务级继续计入模型的 2 次预算。
 - 全程 `auto` 模型。镜像固定 `ANTHROPIC_MODEL=auto_model/urm`、`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`，
@@ -103,6 +105,9 @@ description: >
   pip/Docker、无法启动数据库或后端，即使之后另有本机验证，也不能把这部分写成“验证了/跑通了”
   业务链路；应写“已实现/静态检查通过”，并把未运行项写成具体缺口。`feedback --check` 会生成
   `monitor/feedback-trace-audit.json`，发现反馈越过轨迹能力上限时直接阻断。
+- **Feedback 与轨迹总体意见必须同向。** 高完成度正文若与轨迹最后明确写出的未完成、未实现或阻断结论
+  冲突，`feedback --check` 会写入 `monitor/submission/feedback-consistency-review.json` 并以退出码 4
+  等待本地核验。专家必须对照原始轨迹和本机真实运行登记结论；改动评分或正文会生成新指纹，旧批准失效。
 - Feedback 同时覆盖过程与产物。负面判断写清触发节点、实际行为、客观结果和业务影响；高分也要写
   逐项核对的需求和真实运行结果。
 - Feedback 是给人读的短复盘，不是验收报告：默认 180–280 个非空字，语句通畅，读一遍就能懂。
@@ -268,13 +273,15 @@ python3 $S terminal-sweep                             # 关闭已结束会话残
    受管模式前置要求 `tmux >= 3.0` 且宿主机不是 Windows；不满足时显式阻断，可切回 print。
    `claude.openTerminalOnRun=true` 时，新会话会另开一个可见的 macOS Terminal 窗口并接入 tmux；
    窗口不抢键盘焦点，默认只读接入（`claude.terminalReadOnly=false` 可改为可输入），
-   关闭终端窗口只退出查看，不停止任务。会话结束、放弃、启动失败或重启换会话时，技能会自动关闭
-   对应窗口；启动新会话前和 `cleanup` 时还会清扫已结束会话残留的窗口，也可随时手动执行
-   `terminal-sweep`。仍在运行的会话和用户自己的终端窗口不会被关闭。默认 `false`，避免无人值守和录屏时弹窗。
+   关闭终端窗口只退出查看，不停止任务。窗口内启动的是自回收适配器：即使监督器被强杀、容器异常退出
+   或 tmux 会话自然结束，只要 attach 返回，窗口也会按自己的 tty 主动关闭。会话结束、放弃、启动失败、
+   重启换会话时还会再次定向清理；监督器每 60 秒清扫一次，工作台也每 60 秒调用 `terminal-sweep`。
+   仍在运行的会话和用户自己的终端窗口不会被关闭。默认 `false`，避免无人值守和录屏时弹窗。
    新机器首次进入 REPL 时，技能通过只读 managed settings 预接受镜像既定的 Bypass Permissions 模式；
-   若仍显示确认页（Bypass Permissions、信任文件夹等），技能先移动光标并回读屏幕，确认高亮停在
-   `Yes` 选项后才回车，在确认时限内持续重试；容器已退出时立即识别，不再干等。等待输入框的总时长由
-   `claude.replTimeoutSeconds` 控制（默认 90 秒），超时即重启并记录屏幕快照，最多启动 3 次，
+   若仍显示确认页（Bypass Permissions、信任文件夹、中文“是否信任此文件夹”等），技能会识别编号、
+   箭头和反色光标三种样式。确认项已高亮时先回读再回车；只有文字没有高亮时，Yes 在第一项会先向上
+   归位再确认，绝不会因为没识别到箭头就先按 Down 误选 No。容器已退出时立即识别，不再干等。
+   等待输入框的总时长由 `claude.replTimeoutSeconds` 控制（默认 180 秒），超时即重启并记录屏幕快照，最多启动 3 次，
    tmux 会话创建失败也会自动重试 3 次，不能一直卡在确认页。
    总时长默认 10800 秒，无进展或静默默认 1200 秒；退出开机会话后导出完整 Claude projects 目录，
    校验题面、继续次数、最终轮次、SessionID 和 PromptID，再打产物快照、生成轨迹时间线并推送。
@@ -446,6 +453,7 @@ python3 $S terminal-sweep                             # 关闭已结束会话残
    python3 $S local-review --task-root ROOT --reject  --reviewer 姓名 [--note 说明]
    ```
 
+   Feedback 与轨迹结论出入时加 `--kind feedback`，返修意见漂移时加 `--kind repair`。
    核验结论只对当时核验的那一版评分和 Feedback 有效，之后再改内容需要重新核验。阈值由
    `submission.localReviewScoreDelta`、`submission.localReviewMinSimilarity` 配置。
 
@@ -546,7 +554,8 @@ python3 $S feedback --task-root ROOT --init|--check
 python3 $S submit --task-root ROOT [--dry-run|--execute] [--watch]
 python3 $S submission-status --task-root ROOT --submission-id ID
 python3 $S repair --task-root ROOT --submission-id ID --comment TEXT [--execute] [--watch]
-python3 $S local-review --task-root ROOT [--approve|--reject --reviewer NAME] [--note TEXT]
+python3 $S local-review --task-root ROOT [--kind feedback|repair] \
+  [--approve|--reject --reviewer NAME] [--note TEXT]
 python3 $S capacity                               # 容器名额：上限、运行中、启动中
 python3 $S export --task-root ROOT [--allow-incomplete]
 python3 $S export-batch [--tasks-dir DIR] [--date YYYY-MM-DD] [--out FILE]

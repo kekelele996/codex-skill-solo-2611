@@ -336,12 +336,29 @@ def local_review(
     decision: str = "",
     reviewer: str = "",
     note: str = "",
+    kind: str = "auto",
 ) -> dict[str, Any]:
     """查看或登记本地核验结论。结论只对当时核验的那一版评分和 Feedback 有效。"""
+    if kind not in {"auto", "feedback", "repair"}:
+        raise Solo2611Error(f"未知的本地核验类型: {kind}")
+    feedback_record = fb.consistency_review_path(task_root)
+    if kind == "feedback" or (
+        kind == "auto"
+        and feedback_record.is_file()
+        and not local_review_path(task_root).is_file()
+    ):
+        result = fb.review_consistency(
+            task_root,
+            decision=decision,
+            reviewer=reviewer,
+            note=note,
+        )
+        return {"kind": "feedback", **result}
+
     path = local_review_path(task_root)
     record = _safe_json(path)
     if not record:
-        return {"ok": True, "status": "not_required", "review": str(path)}
+        return {"kind": "repair", "ok": True, "status": "not_required", "review": str(path)}
     if decision:
         if decision not in {"approved", "rejected"}:
             raise Solo2611Error(f"未知的核验结论: {decision}")
@@ -351,7 +368,12 @@ def local_review(
             {"status": decision, "reviewer": reviewer.strip(), "note": note.strip(), "reviewedAt": utc_now()}
         )
         write_json(path, record, mode=0o600)
-    return {"ok": record.get("status") == "approved", "review": str(path), **record}
+    return {
+        "kind": "repair",
+        "ok": record.get("status") == "approved",
+        "review": str(path),
+        **record,
+    }
 
 
 def _safe_json(path: Path) -> dict[str, Any]:

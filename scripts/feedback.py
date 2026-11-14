@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from common import Solo2611Error, non_space_len, read_json, write_json
+from common import Solo2611Error, non_space_len, read_json, sha256_bytes, utc_now, write_json
 import evidence
 from spec import ANCHOR_PATTERN, ARTIFACT_HINT, NEGATIVE_SIGNALS, PROCESS_HINT, RUBRIC_PHRASES, VAGUE_PHRASES
 
@@ -124,6 +124,7 @@ Feedback 写成短复盘，不抄录验收报告：默认 180–280 个非空字
 
 _SECTION = re.compile(r"^##\s*(交付完整性|Feedback|备注)\s*$", re.M)
 _PLACEHOLDER = re.compile(r"（填 1–5 的整数）|（可空[^）]*）")
+CONSISTENCY_REVIEW_REL = Path("monitor") / "submission" / "feedback-consistency-review.json"
 
 
 def parse(path: Path) -> dict[str, str]:
@@ -163,6 +164,100 @@ def ensure_full_score_review_template(task_root: Path) -> Path:
     if not path.exists():
         write_json(path, full_score_review_template())
     return path
+
+
+def consistency_review_path(task_root: Path) -> Path:
+    return task_root / CONSISTENCY_REVIEW_REL
+
+
+def _consistency_fingerprint(score: int, feedback: str, alignment: dict[str, Any]) -> str:
+    opinion = alignment.get("traceOpinion") if isinstance(alignment.get("traceOpinion"), dict) else {}
+    payload = "\n".join(
+        [
+            str(score),
+            re.sub(r"\s+", "", feedback),
+            str(opinion.get("status") or ""),
+            str(opinion.get("finalAssistantEvidence") or ""),
+            *[str(item) for item in opinion.get("conflicts") or []],
+        ]
+    )
+    return sha256_bytes(payload.encode("utf-8"))
+
+
+def _review_consistency(
+    task_root: Path,
+    *,
+    score: int,
+    feedback: str,
+    alignment: dict[str, Any],
+) -> dict[str, Any]:
+    """Require a local review when a high score contradicts a negative trace verdict."""
+    opinion = alignment.get("traceOpinion") if isinstance(alignment.get("traceOpinion"), dict) else {}
+    conflicts = [str(item) for item in opinion.get("conflicts") or [] if str(item).strip()]
+    if not conflicts:
+        return {"required": False, "status": "not_required", "path": str(consistency_review_path(task_root))}
+
+    fingerprint = _consistency_fingerprint(score, feedback, alignment)
+    path = consistency_review_path(task_root)
+    try:
+        record = read_json(path, {}) or {}
+    except Exception:  # noqa: BLE001 - 损坏的核验记录不能当作已批准
+        record = {}
+    same = record.get("fingerprint") == fingerprint
+    if not same or record.get("status") not in {"pending", "approved", "rejected"}:
+        record = {
+            "schemaVersion": 1,
+            "kind": "feedback-trace-consistency",
+            "status": "pending",
+            "fingerprint": fingerprint,
+            "score": score,
+            "feedback": feedback,
+            "conflicts": conflicts,
+            "traceOpinion": opinion,
+            "createdAt": utc_now(),
+        }
+        write_json(path, record, mode=0o600)
+    return {
+        "required": True,
+        "status": str(record.get("status") or "pending"),
+        "path": str(path),
+        "fingerprint": fingerprint,
+        "conflicts": conflicts,
+        "reviewer": str(record.get("reviewer") or ""),
+        "note": str(record.get("note") or ""),
+    }
+
+
+def review_consistency(
+    task_root: Path,
+    *,
+    decision: str = "",
+    reviewer: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    """View or update the feedback-versus-trace local review record."""
+    path = consistency_review_path(task_root)
+    try:
+        record = read_json(path, {}) or {}
+    except Exception:  # noqa: BLE001
+        record = {}
+    if not record:
+        return {"ok": True, "status": "not_required", "review": str(path)}
+    if decision:
+        if decision not in {"approved", "rejected"}:
+            raise Solo2611Error(f"未知的核验结论: {decision}")
+        if not reviewer.strip():
+            raise Solo2611Error("登记本地核验结论必须提供 --reviewer")
+        record.update(
+            {
+                "status": decision,
+                "reviewer": reviewer.strip(),
+                "note": note.strip(),
+                "reviewedAt": utc_now(),
+            }
+        )
+        write_json(path, record, mode=0o600)
+    return {"ok": record.get("status") == "approved", "review": str(path), **record}
 
 
 def _verified_items(data: dict[str, Any], key: str, label: str, minimum: int) -> list[str]:
@@ -461,6 +556,11 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
     verdict: dict[str, Any] | None = None
     full_score_errors: list[str] = []
     full_score_review: dict[str, Any] = {"required": False, "status": "not_applicable"}
+    consistency_review: dict[str, Any] = {
+        "required": False,
+        "status": "not_required",
+        "path": "",
+    }
     if task_root is not None:
         full_score_errors, full_score_review = validate_full_score_review(task_root, score)
         errors.extend(full_score_errors)
@@ -470,6 +570,18 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
         verdict = evidence.check(task_root, state, feedback, score)
         errors.extend(verdict["errors"])
         warnings.extend(verdict["warnings"])
+        consistency_review = _review_consistency(
+            task_root,
+            score=score,
+            feedback=feedback,
+            alignment=verdict.get("traceAlignment") or {},
+        )
+        if consistency_review.get("status") in {"pending", "rejected"}:
+            state_text = "等待本地核验" if consistency_review.get("status") == "pending" else "本地核验未通过"
+            errors.append(
+                f"Feedback 与轨迹的总体结论出入较大，已{state_text}；"
+                f"请先核对原始轨迹和本机运行结果，再执行 local-review --kind feedback"
+            )
     result = {
         "ok": not errors,
         "errors": errors,
@@ -478,6 +590,9 @@ def check(path: Path, *, task_root: Path | None = None, state: dict[str, Any] | 
         "feedback": feedback,
         "remark": "",
         "fullScoreReview": full_score_review,
+        "localReviewRequired": bool(consistency_review.get("required")),
+        "localReviewStatus": str(consistency_review.get("status") or "not_required"),
+        "localReview": consistency_review,
     }
     if verdict is not None:
         result["evidence"] = {

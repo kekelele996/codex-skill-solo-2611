@@ -1,6 +1,6 @@
 # codex-skill-solo-2611
 
-`solo-2611` v0.6.6：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
+`solo-2611` v0.7.0：CC/Codex 26.11 三领域单轮 pointwise 本地交付技能。
 
 支持安全、游戏图形与多媒体、数据工程三套最新分类，默认领域为「数据工程 / 数仓与数据湖」。一题使用一个新容器、一个 session；结构中断时只在原会话发送字面“继续”，最多 2 次。技能负责题面门禁、快照、受管会话、轨迹、真实运行验证、窗口录屏、证据化 Feedback 和官方 19 列交付表。
 
@@ -23,7 +23,8 @@ Python 运行时需要：
 
 系统还需要 `tmux >= 3.0`；受管交互从 v0.6.0 起成为默认运行模式。
 如需在任务启动时看到真实交互终端，可设置 `claude.openTerminalOnRun=true`；默认仍在后台运行。
-窗口只读且不抢焦点，会话结束后自动关闭；残留窗口可用 `python3 scripts/solo2611.py terminal-sweep` 一次清掉。
+窗口只读且不抢焦点，由 attach 适配器在 tmux 退出时按自身 tty 自动关闭；监督器和工作台还会定时清扫
+旧版本残留。仍可用 `python3 scripts/solo2611.py terminal-sweep` 手动清一次。
 
 ```bash
 python3 -m pip install -r requirements.txt
@@ -45,6 +46,9 @@ python3 "$S" config test
 推荐通过 `SOLO2611_API_KEY`、`SOLO2611_BASE_URL` 和 `GITHUB_TOKEN` 提供模型与快照仓库秘密。SOLO2 的提交地址、账号和认证会话只能从本地工作台获取；技能不直接读取系统 Keychain、认证环境变量或缓存 Cookie。
 
 自动提交已按要求开启：`export` 通过后直接上传、新建提交并轮询质检，不再做本地二次确认。只有 `QC_PASSED` 才算通过。
+
+单会话总时限固定不低于 3 小时。容器名额按“Docker 实况 + 启动租约”统一计数，兼容标签丢失的
+`solo2611-*` 旧容器，Docker 查询失败时停止放行。
 
 ## 提示词去重
 
@@ -75,6 +79,7 @@ python3 "$HOME/.codex/skills/solo-2611/scripts/solo2611.py" \
   `轨迹中有存在明文apikey暴露风险`，不记录 Key 原文。
 - Feedback 必须基于真实轨迹、产物快照和 `verify` 运行记录；机器会做事实回查。
 - Feedback 还会按平台 V2 的轨迹能力上限审计；轨迹未运行完整业务链路时，不能写成已经验证或跑通。
+- 高分 Feedback 与轨迹最后的未完成/阻断结论出入较大时，检查会停下并等待本地核验；批准只覆盖当版内容。
 - 误把正常 `end_turn` 判成截断时，先用 `recover-round` 预览，再执行正式轨迹恢复；原始轨迹审计副本必须保留。
 - 重要问题按“触发节点 → 实际行为 → 业务后果 → 证据锚点”写，允许保留 1–2 个最有用的文件名、函数、报错或需求锚点。
 - 困难题的难度论证必须使用 P4 强制合同：`schemaVersion: 2`、`difficultyContract.platform-p4-v2`、

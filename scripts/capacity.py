@@ -29,42 +29,51 @@ from common import STATE_HOME, Solo2611Error, file_lock, out, read_json, run, ut
 
 CONTAINER_LOCK = STATE_HOME / "containers.lock"
 LEASE_FILE = STATE_HOME / "container-leases.json"
-LEASE_TTL_SECONDS = 300.0
+LEASE_TTL_SECONDS = 900.0
 POLL_SECONDS = 5.0
 DEFAULT_WAIT_SECONDS = 1800.0
-CONTAINER_LABEL = "label=solo2611=true"
+MANAGED_PREFIX = "solo2611-"
 
 
 def holder_key(task_root: Path) -> str:
     return "task:" + hashlib.sha256(str(Path(task_root).resolve()).encode()).hexdigest()[:16]
 
 
-def running_containers() -> set[str] | None:
-    """Names of running managed containers; None when Docker gave no usable answer."""
+def _parse_managed_names(text: str) -> set[str]:
+    """Accept both current labels and legacy managed names without a label."""
+    names: set[str] = set()
+    for raw in (text or "").splitlines():
+        name, _, label = raw.partition("\t")
+        name = name.strip()
+        if not name:
+            continue
+        if name.startswith(MANAGED_PREFIX) or label.strip().lower() == "true":
+            names.add(name)
+    return names
+
+
+def _docker_managed_names(*, include_stopped: bool) -> set[str] | None:
+    args = ["docker", "ps"]
+    if include_stopped:
+        args.append("-a")
+    args.extend(["--format", '{{.Names}}\t{{.Label "solo2611"}}'])
     try:
-        result = run(
-            ["docker", "ps", "--filter", CONTAINER_LABEL, "--format", "{{.Names}}"],
-            check=False,
-            timeout=30,
-        )
+        result = run(args, check=False, timeout=30)
     except Exception:  # noqa: BLE001 - 超时或 docker 不存在都按“无法确认”处理
         return None
     if result.returncode != 0:
         return None
-    return set(out(result).split())
+    return _parse_managed_names(out(result))
+
+
+def running_containers() -> set[str] | None:
+    """Names of running managed containers; None when Docker gave no usable answer."""
+    return _docker_managed_names(include_stopped=False)
 
 
 def known_containers() -> set[str]:
     """Names of managed containers in any state; empty when Docker gave no answer."""
-    try:
-        result = run(
-            ["docker", "ps", "-a", "--filter", CONTAINER_LABEL, "--format", "{{.Names}}"],
-            check=False,
-            timeout=30,
-        )
-    except Exception:  # noqa: BLE001
-        return set()
-    return set(out(result).split()) if result.returncode == 0 else set()
+    return _docker_managed_names(include_stopped=True) or set()
 
 
 def _load() -> dict[str, dict[str, Any]]:
@@ -148,15 +157,30 @@ def acquire(
         time.sleep(POLL_SECONDS)
 
 
-def release(holder: str) -> None:
-    """Give the slot back when the launch did not happen; never raises."""
+def release(holder: str) -> bool:
+    """Give the slot back only after confirming no container is running for it.
+
+    A launcher can throw after ``docker run`` has created the container but
+    before state was saved. Releasing that lease blindly would let another
+    launcher claim the same slot and exceed the hard limit.
+    """
     try:
         with file_lock(CONTAINER_LOCK):
             leases = _load()
-            if leases.pop(holder, None) is not None:
-                _save(leases)
+            lease = leases.get(holder)
+            if lease is None:
+                return False
+            container = str(lease.get("container") or "")
+            running = running_containers()
+            if running is None:
+                return False
+            if container and container in running:
+                return False
+            leases.pop(holder, None)
+            _save(leases)
+            return True
     except Exception:  # noqa: BLE001
-        pass
+        return False
 
 
 def release_container(container: str) -> None:
@@ -200,6 +224,7 @@ def snapshot(limit: int) -> dict[str, Any]:
         "limit": int(limit),
         "dockerAvailable": running is not None,
         "running": sorted(running or []),
+        "physicalRunning": len(running or []),
         "pending": [
             {"holder": holder, "container": lease.get("container"), "taskRoot": lease.get("taskRoot")}
             for holder, lease in leases.items()
@@ -207,4 +232,6 @@ def snapshot(limit: int) -> dict[str, Any]:
         "used": used,
         "free": max(0, int(limit) - used) if running is not None else 0,
         "overLimit": running is not None and used > int(limit),
+        "leaseTtlSeconds": int(LEASE_TTL_SECONDS),
+        "managedPrefix": MANAGED_PREFIX,
     }

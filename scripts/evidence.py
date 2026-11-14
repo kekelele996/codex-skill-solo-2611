@@ -81,6 +81,18 @@ RUNTIME_DENIAL = re.compile(
     r"(没有运行验证|未运行验证|没有实际运行|未实际运行|只完成.{0,12}(?:语法|静态)|"
     r"仅完成.{0,12}(?:语法|静态)|无法运行|不能运行|不可用|仍需补|尚未覆盖)"
 )
+TRACE_NEGATIVE_VERDICT = re.compile(
+    r"(?i)(?:(?:未能|没有|无法|不能)(?:完成|实现|修复|解决|交付|运行验证|通过)|"
+    r"(?:仍|尚)(?:未|缺)|blocked|unable to (?:complete|implement|run)|"
+    r"not implemented|incomplete|tests? failed)"
+)
+FEEDBACK_POSITIVE_OPINION = re.compile(
+    r"(逐条|逐项|实际|真实)?(?:核对|检查|验证|运行|回读).{0,30}(?:通过|成功|正常|完成)|"
+    r"(?:已完成|已实现|能够|可以|跑通)"
+)
+FEEDBACK_GAP_ACK = re.compile(
+    r"(未实现|未完成|无法|失败|缺口|仍需|限制|没有运行验证|未运行验证|尚未覆盖|待补)"
+)
 
 INLINE_EXEC = {
     "python", "python3", "python3.11", "python3.12", "python3.13", "python3.14",
@@ -205,6 +217,7 @@ def _trace_facts(task_root: Path) -> dict[str, Any]:
         "outputs": [],
         "commands": [],
         "assistant_texts": [],
+        "finalAssistantText": "",
         "paths": set(),
         "failed": False,
         "steps": 0,
@@ -220,6 +233,13 @@ def _trace_facts(task_root: Path) -> dict[str, Any]:
             events = tr.load_events(path)
         except Solo2611Error:
             continue
+        for event in events:
+            if event.get("type") != "assistant" or event.get("isSidechain"):
+                continue
+            message = event.get("message") if isinstance(event.get("message"), dict) else {}
+            text = tr._text_of(message.get("content")).strip()
+            if text:
+                facts["finalAssistantText"] = text
         for block in _content_blocks(events):
             kind = block.get("type")
             if kind == "tool_use":
@@ -338,7 +358,12 @@ def _evidence_snippet(text: str, pattern: re.Pattern[str]) -> str:
     return re.sub(r"\s+", " ", text[start:end]).strip()
 
 
-def audit_trace_alignment(feedback: str, trace_facts: dict[str, Any]) -> dict[str, Any]:
+def audit_trace_alignment(
+    feedback: str,
+    trace_facts: dict[str, Any],
+    *,
+    score: int = 0,
+) -> dict[str, Any]:
     """审计 Feedback 是否越过轨迹能证明的验证层级。
 
     轨迹中的 assistant 文本不能证明功能成功，但可以证明其自我承认的能力上限。
@@ -355,6 +380,20 @@ def audit_trace_alignment(feedback: str, trace_facts: dict[str, Any]) -> dict[st
         for sentence in _claim_sentences(feedback):
             if BUSINESS_RUNTIME_CLAIM.search(sentence) and not RUNTIME_DENIAL.search(sentence):
                 unsupported.append(sentence)
+    final_text = str(trace_facts.get("finalAssistantText") or "")
+    trace_negative = bool(TRACE_NEGATIVE_VERDICT.search(final_text))
+    feedback_positive = bool(FEEDBACK_POSITIVE_OPINION.search(feedback))
+    feedback_gap = bool(FEEDBACK_GAP_ACK.search(feedback))
+    conflict_sentences = [
+        sentence
+        for sentence in _claim_sentences(feedback)
+        if FEEDBACK_POSITIVE_OPINION.search(sentence) and not FEEDBACK_GAP_ACK.search(sentence)
+    ]
+    opinion_conflicts: list[str] = []
+    if score >= 4 and trace_negative and feedback_positive:
+        opinion_conflicts = conflict_sentences or [
+            "Feedback 用高完成度表达覆盖了轨迹中的未完成或阻断结论"
+        ]
     level = "runtime-blocked-static-only" if static_only else (
         "runtime-blocked" if limited else "unknown"
     )
@@ -368,6 +407,17 @@ def audit_trace_alignment(feedback: str, trace_facts: dict[str, Any]) -> dict[st
         "limitationEvidence": _evidence_snippet(trace_text, TRACE_RUNTIME_LIMIT) if limited else "",
         "staticEvidence": _evidence_snippet(trace_text, STATIC_VERIFICATION)
         if STATIC_VERIFICATION.search(trace_text) else "",
+        "traceOpinion": {
+            "status": "negative" if trace_negative else "neutral_or_positive",
+            "finalAssistantEvidence": _evidence_snippet(
+                final_text,
+                TRACE_NEGATIVE_VERDICT,
+            )
+            if trace_negative
+            else final_text[-600:],
+            "feedbackAcknowledgement": feedback_gap,
+            "conflicts": opinion_conflicts,
+        },
     }
 
 
@@ -454,7 +504,11 @@ def check(task_root: Path, state: dict[str, Any], feedback: str, score: int) -> 
     errors: list[str] = []
     warnings: list[str] = []
     claims: list[dict[str, Any]] = []
-    trace_alignment = audit_trace_alignment(feedback, corpus.get("_traceFacts") or {})
+    trace_alignment = audit_trace_alignment(
+        feedback,
+        corpus.get("_traceFacts") or {},
+        score=score,
+    )
     index["traceAlignment"] = trace_alignment
     if trace_alignment["unsupportedRuntimeClaims"]:
         errors.append(
